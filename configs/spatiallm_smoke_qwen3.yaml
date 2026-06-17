@@ -1,0 +1,47 @@
+### model
+# Assembled init checkpoint: Qwen3-1.7B backbone + Sonata encoder + random projector
+model_name_or_path: /root/lnj/models/SpatialLM-Qwen3-1.7B-init
+trust_remote_code: true
+train_from_scratch: false  # load the assembled pretrained LLM+Sonata weights
+
+### method
+do_train: true
+freeze_language_tower: false
+freeze_point_tower: false
+train_proj_only: false
+flash_attn: disabled  # smoke test runs without flash-attn (LLM uses eager/sdpa)
+
+### dataset
+dataset: smoke_one_train
+dataset_dir: /root/lnj/data/smoke
+template: spatiallm_qwen3
+num_bins: 1280
+do_augmentation: false
+random_rotation: true
+cutoff_len: 8192
+overwrite_cache: true
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
+max_samples: 1
+# NOTE: save_dir intentionally unset -> single-phase run (no preprocess-then-exit)
+
+### output
+output_dir: /root/lnj/SpatialLM/saves/smoke_qwen3
+logging_steps: 1
+save_strategy: "no"
+overwrite_output_dir: true
+report_to: none
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 1
+learning_rate: 1.0e-4
+max_steps: 12
+lr_scheduler_type: constant
+warmup_ratio: 0.0
+pure_bf16: false
+bf16: true
+fp16: false
+tf32: true
+ddp_timeout: 180000000
+max_new_tokens: 4096

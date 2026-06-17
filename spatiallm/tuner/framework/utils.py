@@ -120,6 +120,7 @@ def check_dependencies() -> None:
     r"""
     Checks the version of the required packages.
     """
-    check_version("transformers>=4.41.2,<=4.46.1")
+    # Upper bound raised from 4.46.1 to support the Qwen3 backbone (spatiallm_qwen3).
+    check_version("transformers>=4.41.2,<=4.53.0")
     check_version("datasets>=2.16.0,<=3.6.0")
     check_version("accelerate>=0.34.0,<=1.7.0")

@@ -363,3 +363,25 @@ def register_spatiallm_templates(
         ),
         cutoff_len=cutoff_len,
     )
+
+    # Qwen3 uses the same ChatML chat format as Qwen2.5, so this template mirrors
+    # `spatiallm_qwen`. It is registered separately so the backbone choice is explicit.
+    register_template(
+        name="spatiallm_qwen3",
+        format_user=StringFormatter(
+            slots=["<|im_start|>user\n{{content}}<|im_end|>\n<|im_start|>assistant\n"]
+        ),
+        format_assistant=StringFormatter(slots=["{{content}}<|im_end|>\n"]),
+        format_system=StringFormatter(
+            slots=["<|im_start|>system\n{{content}}<|im_end|>\n"]
+        ),
+        default_system="You are a helpful assistant.",
+        stop_words=["<|im_end|>"],
+        mm_plugin=get_mm_plugin(
+            point_token="<|point_pad|>",
+            num_bins=num_bins,
+            do_augmentation=do_augmentation,
+            random_rotation=random_rotation,
+        ),
+        cutoff_len=cutoff_len,
+    )

@@ -166,3 +166,6 @@ cython_debug/
 *.txt
 *.rrd
 *.ply
+
+# Training outputs
+saves/

@@ -8,10 +8,10 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = ">=3.10,<=3.12"
-torch = { version = "^2.4.1+cu124", source = "pytorch" }
-torchvision = { version = "^0.19.1+cu124", source = "pytorch" }
-torchaudio = { version = "^2.4.1+cu124", source = "pytorch" }
-transformers = ">=4.41.2,<=4.46.1"
+torch = { version = ">=2.4.1", source = "pytorch" }
+torchvision = { version = ">=0.19.1", source = "pytorch" }
+torchaudio = { version = ">=2.4.1", source = "pytorch" }
+transformers = ">=4.41.2,<=4.53.0"
 safetensors = "^0.4.5"
 pandas = "^2.2.3"
 einops = "^0.8.1"
