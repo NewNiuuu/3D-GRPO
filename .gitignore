@@ -169,3 +169,6 @@ cython_debug/
 
 # Training outputs
 saves/
+
+# Local data
+/data/

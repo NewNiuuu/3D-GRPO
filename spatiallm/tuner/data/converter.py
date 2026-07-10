@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional, Union
 
 from ..framework import logging
 from .template import Role
+from ...pcd.blob_utils import has_blob_config
 
 
 if TYPE_CHECKING:
@@ -54,12 +55,13 @@ class DatasetConverter:
             medias = medias[:]
 
         if self.dataset_attr.load_from in ["file"]:
+            skip_missing_media_warning = has_blob_config()
             if isinstance(medias[0], str):
                 for i in range(len(medias)):
                     media_path = os.path.join(self.data_args.media_dir, medias[i])
                     if os.path.isfile(media_path):
                         medias[i] = media_path
-                    else:
+                    elif not skip_missing_media_warning:
                         logger.warning_rank0_once(
                             f"Media {medias[i]} does not exist in `media_dir`. Use original path."
                         )
@@ -72,7 +74,7 @@ class DatasetConverter:
                         )
                         if os.path.isfile(media_path):
                             medias[i][j] = media_path
-                        else:
+                        elif not skip_missing_media_warning:
                             logger.warning_rank0_once(
                                 f"Media {medias[i][j]} does not exist in `media_dir`. Use original path."
                             )

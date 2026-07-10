@@ -11,7 +11,7 @@ train_proj_only: false
 flash_attn: fa2
 
 ### dataset
-dataset: floodnet_train,ladi_train,aircop_real2_train,aircop_sim_train,urbanvideo_train,nescene_train
+dataset: ladi_train,aavg_train,refdrone_train,aavg_detection_train,aircop_sim_train,avimath_train,floodnet_train,urbanvideo_train,aircop_real2_train,dvg_train
 dataset_dir: data
 template: spatiallm_qwen3
 num_bins: 1280
@@ -23,10 +23,10 @@ preprocessing_num_workers: 16
 dataloader_num_workers: 8
 
 ### output
-output_dir: /root/lnj/SpatialLM/saves/vqa_train_part_data
-logging_steps: 50
-save_steps: 1000
-save_total_limit: 3
+output_dir: /root/lnj/SpatialLM/saves/mixed_test
+logging_steps: 10
+save_steps: 9999
+save_total_limit: 1
 overwrite_output_dir: true
 report_to: none
 
@@ -34,7 +34,7 @@ report_to: none
 per_device_train_batch_size: 4
 gradient_accumulation_steps: 4
 learning_rate: 2.0e-5
-num_train_epochs: 3
+num_train_epochs: 1
 lr_scheduler_type: cosine
 warmup_ratio: 0.03
 bf16: true
@@ -47,4 +47,4 @@ max_new_tokens: 4096
 val_size: 0.01
 per_device_eval_batch_size: 4
 eval_strategy: steps
-eval_steps: 1000
+eval_steps: 9999
