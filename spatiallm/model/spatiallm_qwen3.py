@@ -293,6 +293,20 @@ class SpatialLMQwen3ForCausalLM(Qwen3ForCausalLM):
                 attention_mask.shape[1] == inputs_embeds.shape[1]
             ), "The length of attention mask and inputs embeds should be the same"
 
+        # Point cloud insertion expands the sequence length, so the position_ids /
+        # cache_position passed by `generate` (based on the original input length)
+        # are stale. Recompute them from the real cache length to keep the KV-cache
+        # aligned. This mirrors the base Model.forward fallback when both are None.
+        past_seen_tokens = (
+            past_key_values.get_seq_length() if past_key_values is not None else 0
+        )
+        cache_position = torch.arange(
+            past_seen_tokens,
+            past_seen_tokens + inputs_embeds.shape[1],
+            device=inputs_embeds.device,
+        )
+        position_ids = cache_position.unsqueeze(0)
+
         # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=None,
