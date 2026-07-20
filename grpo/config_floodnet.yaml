@@ -1,0 +1,37 @@
+# SpatialLM GRPO 配置 —— 只用 floodnet 数据集，四卡训练
+# 环境: uavlm (transformers 4.53)
+# 启动: torchrun --nproc_per_node 4 grpo/train_grpo.py --config grpo/config_floodnet.yaml
+
+### 模型（在 SFT 得到的 ckpt 基础上做 RL）
+model_path: /root/lnj/saves/point_mixed_downsample
+dtype: bfloat16
+
+### 数据（只用 floodnet）
+train_json: data/Floodnet/train.json
+max_samples: null          # null=全量 4511 条；调试可设小值如 32
+num_bins: 1280
+
+### GRPO 采样
+num_generations: 4         # 每个 prompt 采样几段（组大小）
+max_new_tokens: 64         # floodnet 答案很短，64 足够
+temperature: 1.0
+top_p: 1.0
+top_k: 0
+
+### 训练（四卡：有效 batch = 4卡 x per_device x accum）
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-6
+num_train_epochs: 1
+warmup_ratio: 0.03
+lr_scheduler_type: constant
+gradient_checkpointing: true
+dataloader_num_workers: 2
+
+### 输出/日志
+output_dir: /root/lnj/SpatialLM/saves/grpo_floodnet
+logging_steps: 1
+save_steps: 500
+save_total_limit: 2
+report_to: none            # 可改 wandb
+# max_steps: 20            # 取消注释可限制步数（调试）
