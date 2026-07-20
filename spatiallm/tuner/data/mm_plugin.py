@@ -1,4 +1,6 @@
 import os
+import re
+import json
 from copy import deepcopy
 from typing import TYPE_CHECKING, Dict, List, Union, Sequence, Optional, Tuple
 
@@ -22,6 +24,9 @@ LAYOUT_E_PLACEHOLDER = os.environ.get("LAYOUT_E_PLACEHOLDER", "<|layout_e|>")
 POINT_S_TOKEN = os.environ.get("POINT_S_TOKEN", "<|point_start|>")
 POINT_E_TOKEN = os.environ.get("POINT_E_TOKEN", "<|point_end|>")
 POINT_CLOUD_PLACEHOLDER = os.environ.get("POINT_CLOUD_PLACEHOLDER", "<point_cloud>")
+
+# Matches a ```json ... ``` fenced block used by grounding (bbox_3d) answers.
+BBOX_JSON_FENCE_RE = re.compile(r"```json\s*(.*?)```", re.DOTALL)
 
 
 class SpatialLMPlugin:
@@ -196,6 +201,48 @@ class SpatialLMPlugin:
         self._validate_input(point_clouds)
         return input_ids, labels
 
+    def _transform_bbox_json(self, content: str, transformation: dict) -> str:
+        r"""
+        Sync the point cloud augmentation (scale + z-rotation + PositiveShift mirror)
+        onto grounding answers formatted as a ```json fenced block containing objects
+        like {"bbox_3d": [[x, y, z] x 8 corner points], "label": "..."}.
+
+        The exact same geometric transform applied to the point cloud in
+        `_get_mm_inputs` is applied to every corner point:
+            p' = R_z(angle_z) @ ((p - center_pt) * scaling) + center_pt - min_bound
+        Coordinates stay continuous floats (no discretization). The original text
+        format ("[\n\t{obj}\n]", one bbox object per line) is preserved so the model's
+        learning target is unchanged apart from the coordinate values.
+        """
+        match = BBOX_JSON_FENCE_RE.search(content)
+        if match is None:
+            return content
+        try:
+            objs = json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            return content
+        if not isinstance(objs, list):
+            return content
+
+        rotmat = R.from_rotvec(np.array([0, 0, transformation["angle_z"]])).as_matrix()
+        center = np.asarray(transformation["center_pt"], dtype=float)
+        scaling = transformation["scaling"]
+        min_bound = np.asarray(transformation["min_bound"], dtype=float)
+
+        obj_strs = []
+        for obj in objs:
+            corners = obj.get("bbox_3d") if isinstance(obj, dict) else None
+            if corners:
+                pts = np.asarray(corners, dtype=float)  # (8, 3)
+                # X @ rotmat.T == (rotmat @ X.T).T ; mirrors _get_mm_inputs line ~145
+                pts = ((pts - center) * scaling) @ rotmat.T + center - min_bound
+                obj["bbox_3d"] = [[round(float(v), 4) for v in p] for p in pts]
+            # Preserve key order and inline (one object per line) formatting.
+            obj_strs.append(json.dumps(obj, ensure_ascii=False))
+
+        new_block = "```json\n[\n\t" + ",\n\t".join(obj_strs) + "\n]\n```"
+        return content.replace(match.group(0), new_block)
+
     def process_messages(
         self,
         messages: Sequence[Dict[str, str]],
@@ -238,6 +285,13 @@ class SpatialLMPlugin:
                     new_layout_content,
                 )
                 message["content"] = content
+
+            elif '"bbox_3d"' in content:
+                # Grounding answers use a ```json fenced block with bbox_3d corner
+                # points instead of the parametric layout placeholders. Same point
+                # cloud index as the layout branch (num_point_tokens - 1).
+                transformation = transformations[num_point_tokens - 1]
+                message["content"] = self._transform_bbox_json(content, transformation)
 
             if POINT_CLOUD_PLACEHOLDER in content:
                 content = content.replace(
