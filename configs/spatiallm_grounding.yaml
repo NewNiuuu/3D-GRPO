@@ -11,7 +11,9 @@ train_proj_only: false
 flash_attn: fa2
 
 ### dataset
-dataset: ladi_train,aavg_train,refdrone_train,aavg_detection_train,aircop_sim_train,avimath_train,floodnet_train,urbanvideo_train,aircop_real2_train,dvg_train
+# VQA:Grounding ~= 60:40. avimath/ladi 走 downsample 版(num_samples 在 dataset_info.json 里设定),
+# grounding 全量保留(aavg/aavg_detection/refdrone/dvg),VQA 小数据集全量保留(aircop/floodnet/urbanvideo)。
+dataset: aavg_train,refdrone_train,aavg_detection_train,dvg_train
 dataset_dir: data
 template: spatiallm_qwen3
 num_bins: 1280
@@ -24,18 +26,18 @@ preprocessing_num_workers: 16
 dataloader_num_workers: 8
 
 ### output
-output_dir: /root/lnj/saves/mixed_test
+output_dir: /root/lnj/saves/spatiallm_grounding
 logging_steps: 10
-save_steps: 9999
-save_total_limit: 1
+save_steps: 1000
+save_total_limit: 3
 overwrite_output_dir: true
 report_to: none
 
 ### train
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 4
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 8
 learning_rate: 2.0e-5
-num_train_epochs: 1
+num_train_epochs: 3.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.03
 bf16: true
@@ -45,7 +47,7 @@ ddp_timeout: 180000000
 max_new_tokens: 4096
 
 ### eval
-val_size: 0.01
-per_device_eval_batch_size: 4
-eval_strategy: steps
-eval_steps: 9999
+# val_size: 0.01
+# per_device_eval_batch_size: 4
+# eval_strategy: steps
+# eval_steps: 1000

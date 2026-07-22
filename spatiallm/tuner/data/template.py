@@ -315,8 +315,9 @@ def register_template(
 def register_spatiallm_templates(
     cutoff_len: int = 8192,
     num_bins: int = 1280,
-    do_augmentation: bool = False,
+    do_color_augmentation: bool = False,
     random_rotation: bool = False,
+    do_transform_augmentation: bool = True,
 ):
     register_template(
         name="spatiallm_llama",
@@ -338,8 +339,9 @@ def register_spatiallm_templates(
         mm_plugin=get_mm_plugin(
             point_token="<|point_pad|>",
             num_bins=num_bins,
-            do_augmentation=do_augmentation,
+            do_color_augmentation=do_color_augmentation,
             random_rotation=random_rotation,
+            do_transform_augmentation=do_transform_augmentation,
         ),
         cutoff_len=cutoff_len,
     )
@@ -358,8 +360,9 @@ def register_spatiallm_templates(
         mm_plugin=get_mm_plugin(
             point_token="<|point_pad|>",
             num_bins=num_bins,
-            do_augmentation=do_augmentation,
+            do_color_augmentation=do_color_augmentation,
             random_rotation=random_rotation,
+            do_transform_augmentation=do_transform_augmentation,
         ),
         cutoff_len=cutoff_len,
     )
@@ -380,8 +383,9 @@ def register_spatiallm_templates(
         mm_plugin=get_mm_plugin(
             point_token="<|point_pad|>",
             num_bins=num_bins,
-            do_augmentation=do_augmentation,
+            do_color_augmentation=do_color_augmentation,
             random_rotation=random_rotation,
+            do_transform_augmentation=do_transform_augmentation,
         ),
         cutoff_len=cutoff_len,
     )

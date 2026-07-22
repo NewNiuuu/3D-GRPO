@@ -110,8 +110,9 @@ def run_sft(
     register_spatiallm_templates(
         cutoff_len=data_args.cutoff_len,
         num_bins=data_args.num_bins,
-        do_augmentation=data_args.do_augmentation,
+        do_color_augmentation=data_args.do_color_augmentation,
         random_rotation=data_args.random_rotation,
+        do_transform_augmentation=data_args.do_transform_augmentation,
     )
 
     template = get_template_and_fix_tokenizer(tokenizer, data_args)

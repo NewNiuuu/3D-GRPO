@@ -34,16 +34,24 @@ class SpatialLMPlugin:
         self,
         point_token: str = "<|point_pad|>",
         num_bins: int = 1280,
-        do_augmentation: bool = False,
+        do_color_augmentation: bool = False,
         random_rotation: bool = False,
+        do_transform_augmentation: bool = True,
     ):
         self.point_token = point_token
 
         global_extent = NORMALIZATION_PRESET["world"]
         self.num_bins = num_bins
         self.grid_size = (global_extent[1] - global_extent[0]) / self.num_bins
-        self.do_augmentation = do_augmentation
+        self.do_color_augmentation = do_color_augmentation
         self.random_rotation = random_rotation
+        # Random scale + z-rotation applied to both the point cloud and the GT
+        # boxes. This is a training-time augmentation and MUST be disabled during
+        # eval/predict, otherwise predictions live in a randomly transformed frame
+        # and cannot be matched against original-frame GT boxes. Note: the
+        # -min_bound shift is applied regardless (the model always emits boxes in
+        # the min_bound-shifted, >0 frame).
+        self.do_transform_augmentation = do_transform_augmentation
         self.augmentation = Compose(
             [
                 dict(type="RandomColorGrayScale", p=0.05),
@@ -129,19 +137,28 @@ class SpatialLMPlugin:
             pcd = load_o3d_pcd(pcd_path)
             points, colors = get_points_and_colors(pcd)
 
-            if self.do_augmentation:
+            if self.do_color_augmentation:
                 data_aug = {"name": "pcd", "coord": points, "color": colors}
                 data_aug = self.augmentation(data_aug)
                 points = data_aug["coord"]
                 colors = data_aug["color"]
 
-            # randomly apply scale and rotation transformation to the point cloud
-            if self.random_rotation:
-                angle_z = np.random.random() * 2 * np.pi
+            # randomly apply scale and rotation transformation to the point cloud.
+            # These are training-time augmentations only: when do_transform_augmentation
+            # is False (e.g. during eval/predict) we must NOT scale or rotate,
+            # otherwise predictions live in a randomly transformed frame and cannot
+            # be matched against the original-frame GT boxes. The -min_bound shift
+            # below is kept in both cases, since the model is always trained to emit
+            # boxes in the min_bound-shifted (>0) frame.
+            if self.do_transform_augmentation:
+                if self.random_rotation:
+                    angle_z = np.random.random() * 2 * np.pi
+                else:
+                    angle_z = np.random.choice(np.array([0, 0.5, 1.0, 1.5]) * np.pi)
+                scaling = np.random.uniform(0.75, 1.25)
             else:
-                angle_z = np.random.choice(np.array([0, 0.5, 1.0, 1.5]) * np.pi)
-
-            scaling = np.random.uniform(0.75, 1.25)
+                angle_z = 0.0
+                scaling = 1.0
             rotmat = R.from_rotvec(np.array([0, 0, angle_z])).as_matrix()
             min_bound = points.min(axis=0)
             max_bound = points.max(axis=0)

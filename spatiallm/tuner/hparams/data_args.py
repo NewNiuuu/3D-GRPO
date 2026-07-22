@@ -119,13 +119,25 @@ class DataArguments:
         default=1280,
         metadata={"help": "The number of bins for point cloud quantization."},
     )
-    do_augmentation: bool = field(
+    do_color_augmentation: bool = field(
         default=False,
         metadata={"help": "Whether or not to do data augmentation."},
     )
     random_rotation: bool = field(
         default=False,
         metadata={"help": "Whether or not to do non axis-aligned random rotation."},
+    )
+    do_transform_augmentation: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Whether to apply random scale + z-rotation to the point cloud and "
+                "GT boxes. This is a training-time augmentation and MUST be set to "
+                "False during eval/predict, otherwise predictions live in a randomly "
+                "transformed frame and cannot be matched against original-frame GT "
+                "boxes. The -min_bound shift is applied regardless."
+            )
+        },
     )
 
     def __post_init__(self):

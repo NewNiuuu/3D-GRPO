@@ -13,7 +13,8 @@ dataset: arkitscenes_train # arkitscenes_train,arkitscenes_val
 dataset_dir: arkitscenes-spatiallm # arkitscenes-spatiallm
 template: spatiallm_qwen # spatiallm_qwen, spatiallm_llama
 num_bins: 1280
-do_augmentation: false
+do_color_augmentation: false
+do_transform_augmentation: true
 random_rotation: true
 cutoff_len: 8192
 overwrite_cache: true

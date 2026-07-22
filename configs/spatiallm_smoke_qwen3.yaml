@@ -16,7 +16,8 @@ dataset: smoke_one_train
 dataset_dir: /root/lnj/data/smoke
 template: spatiallm_qwen3
 num_bins: 1280
-do_augmentation: false
+do_color_augmentation: false
+do_transform_augmentation: true
 random_rotation: true
 cutoff_len: 8192
 overwrite_cache: true
