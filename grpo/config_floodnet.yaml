@@ -18,6 +18,11 @@ temperature: 1.0
 top_p: 1.0
 top_k: 0
 
+### GRPO 目标
+kl_coef: 0.04              # β：KL 惩罚系数。>0 会加载一份冻结 ref model；设 0 关闭 KL 省显存
+clip_eps: 0.2              # PPO clip 范围 ε（单步 num_iterations=1 时不生效）
+num_iterations: 1          # 每批 rollout 更新几次；=1 单步 on-policy，>1 才启用 clip 语义
+
 ### 训练（四卡：有效 batch = 4卡 x per_device x accum）
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4

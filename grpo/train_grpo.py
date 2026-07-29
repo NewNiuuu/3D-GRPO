@@ -53,6 +53,16 @@ def main():
     model.set_point_backbone_dtype(torch.float32)  # 点云编码器保持 fp32（与推理一致）
     model.config.use_cache = False  # 训练关掉 KV cache
 
+    # ---- reference model（冻结，用于 KL 惩罚）----
+    # 默认从同一 SFT ckpt 再加载一份作为 π_ref。kl_coef=0 时可关闭以省显存。
+    ref_model = None
+    if float(cfg.get("kl_coef", 0.04)) > 0:
+        ref_model = load_spatiallm(cfg["model_path"], dtype=dtype)
+        ref_model.set_point_backbone_dtype(torch.float32)
+        ref_model.config.use_cache = False
+        ref_model.requires_grad_(False)
+        ref_model.eval()
+
     # ---- 数据集（只用 floodnet）----
     train_ds = FloodnetGRPODataset(
         cfg["train_json"], max_samples=cfg.get("max_samples")
@@ -89,6 +99,10 @@ def main():
         args=training_args,
         train_dataset=train_ds,
         tokenizer=tokenizer,
+        ref_model=ref_model,
+        kl_coef=float(cfg.get("kl_coef", 0.04)),
+        clip_eps=float(cfg.get("clip_eps", 0.2)),
+        num_iterations=cfg.get("num_iterations", 1),
         num_generations=cfg.get("num_generations", 4),
         num_bins=cfg.get("num_bins", 1280),
         max_new_tokens=cfg.get("max_new_tokens", 64),
