@@ -572,7 +572,79 @@ stream_release_lag: 2       # 滞后 2 个窗口再删，防止预取/训练错�
 
 ---
 
-## 附：当前实现的已知限制
+## 十、训完怎么测 checkpoint
+
+### 先说清楚仓库里**没有**什么
+
+- **根目录的 `eval.py` 用不了。** 它是 SpatialLM 原版的**室内布局估计**评测——算
+  wall/door/window 和 20 类家具 bbox 的 F1@IoU0.25/0.50，输入是 layout txt 文件对。
+  和选择题准确率毫无关系。`inference.py`（`generate_layout`）同理。这两个是上游
+  SpatialLM 留下的，跟 GRPO 这条线没有交集。
+- **没有 val/test split。** `data/AirCopBench/` 下四个全是 `*_VQA_train.json`，
+  UrbanVideo 只有一个 MCQ json。且训练配置是 `max_samples: null`，**全量参与训练**。
+
+所以下面这个脚本抽的是**训练集的子集**：accuracy 涨了只能说明"没训坏 / 在见过的题上更准了"，
+**不能证明泛化**。要证明泛化必须先切一份留出集重训——目前选择是不切。
+
+### `grpo/eval_mcq.py`
+
+```bash
+# 单个 ckpt
+CUDA_VISIBLE_DEVICES=0 /home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/python \
+  grpo/eval_mcq.py --config grpo/config_aircop.yaml -n 512
+
+# 多个 ckpt 对比（跑在完全相同的题上，最后出对比表）
+CUDA_VISIBLE_DEVICES=0 /home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/python \
+  grpo/eval_mcq.py --config grpo/config_aircop.yaml -n 2000 \
+    --ckpt /home/aiscuser/nyp/ckpts/point_mixed_downsample \
+    --ckpt /home/aiscuser/nyp/saves/grpo_aircop/checkpoint-200 \
+    --ckpt /home/aiscuser/nyp/saves/grpo_aircop
+```
+
+**第一个 `--ckpt` 传 SFT 原始权重当基线**，对比表里的 Δ 就是 GRPO 带来的增量。
+
+与 `probe_signal.py` 的分工：probe 开训**前**用（随机采样 G 条，看
+`frac_nonzero_adv` 够不够学）；eval_mcq 训完**后**用（贪心解码，看 accuracy 涨没涨）。
+关键差别是 **`do_sample=False`**——probe 走随机采样，同一 ckpt 每次跑结果都不同，
+不能用来做 ckpt 间比较。这里必须贪心。所有 ckpt 用同一个 `--seed` 抽同一批题。
+
+### 输出长什么样（AirCop n=60 实测）
+
+```
+  overall accuracy     = 0.9333  (56/60)
+  parse_fail_rate      = 0.0000
+  mean_completion_len  = 1.0 tokens
+  众数基线（全答 B）  = 0.4000   <- 低于这个说明模型没在做题
+
+  按数据集 split:
+    Sim3_VQA_train       0.9459   (35/37)
+    Sim6_VQA_train       1.0000   (10/10)
+    Real2_VQA_train      0.7778   (7/9)
+    ...
+  按 GT 字母（该字母的题答对了多少）:
+    A  0.9545 (21/22)   B  0.9167 (22/24)   C  1.0000 (9/9)   D  0.8000 (4/5)
+
+  GT   分布 = {'A': 22, 'B': 24, 'C': 9, 'D': 5}
+  预测 分布 = {'A': 23, 'B': 23, 'C': 10, 'D': 4}
+```
+
+三个分项各自回答一个问题：
+
+- **众数基线** —— AirCop 的 GT 分布很偏（A 占 44.7%），无脑全答 A 就有 0.447。
+  accuracy 掉到这个数附近 = 策略塌成了常数，不是"效果一般"而是训崩了。
+- **按 split** —— AirCop 的 Real2 是真实数据、Sim* 是仿真，分开看能发现"仿真涨了但真实掉了"这种情况。
+  UrbanVideo 自动按文件名前缀拆成 EmbodiedCity / AerialVLN。
+- **GT 分布 vs 预测分布** —— 两行越接近越好。预测明显塌向某个字母是训崩的典型征兆，
+  而且它比 accuracy 下降出现得更早。
+
+贪心解码下 AirCop ≈ **0.24 s/条**：n=512 约 2 分钟，n=2000 约 8 分钟。
+UrbanVideo 慢得多（单个 ply 125 MB，读盘是瓶颈）。
+n 越小噪声越大，想区分 1~2 个百分点的差距建议 `-n 2000` 以上。
+
+> 注：贪心 accuracy 会明显高于 `probe_signal.py` 的采样 accuracy
+>（AirCop 实测 0.933 vs 0.859），这是解码方式的差异，不是模型变好了。**只和贪心比贪心。**
+
+
 
 调查过程中发现的、与"能否跑出效果"相关的设计限制，供调参时参考：
 
@@ -621,6 +693,7 @@ stream_release_lag: 2       # 滞后 2 个窗口再删，防止预取/训练错�
 | `config_aircop.yaml` | 新增：AirCop 8 卡主力配置（`max_points: 0`，`stream_window_files: 192`） |
 | `config_urbanvideo.yaml` | 新增：UrbanVideo 单卡配置（`max_points: 65536`，`stream_window_files: 24`），header 记录了 OOM 现状与所有试过无效的办法 |
 | `blob_stream.py` | 新增：边下边训采样器（文件级 shuffle + 窗口内 shuffle + 预取 + 滞后删除） |
+| `eval_mcq.py` | 新增：选择题 ckpt 评测（贪心解码、多 ckpt 对比、按 split / 按 GT 字母拆解 + 众数基线）。根目录 `eval.py` 是布局估计 F1，与选择题无关，用不了 |
 | `train_grpo.py` | 透传 `max_points` / `stream_sampler`；wandb 环境变量提前注入；训练结束打印峰值显存 |
 | `.gitignore` | 追加 `wandb/` |
 
