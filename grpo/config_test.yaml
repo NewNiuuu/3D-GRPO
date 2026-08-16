@@ -1,14 +1,14 @@
-# SpatialLM GRPO 配置 —— 只用 floodnet 数据集，四卡训练
-# 环境: uavlm (transformers 4.53)
-# 启动: torchrun --nproc_per_node 4 grpo/train_grpo.py --config grpo/config_floodnet.yaml
+# SpatialLM GRPO 配置 —— AirCopBench 选择题数据集，四卡训练
+# 环境: conda activate spatiallm-grpo (torch 2.7.1+cu126 / transformers 4.53.0)
+# 启动: cd /home/aiscuser/nyp/3D-RL && torchrun --nproc_per_node 4 grpo/train_grpo.py --config grpo/config_test.yaml
 
 ### 模型（在 SFT 得到的 ckpt 基础上做 RL）
-model_path: /root/lnj/saves/point_mixed_downsample
+model_path: /home/aiscuser/nyp/ckpts/point_mixed_downsample
 dtype: bfloat16
 
-### 数据（只用 floodnet）
-train_json: data/Floodnet/train.json
-max_samples: null          # null=全量 4511 条；调试可设小值如 32
+### 数据（A/B/C/D 选择题）
+train_json: data/grpo_test.json
+max_samples: null          # null=全量 13578 条（935 个唯一点云）；调试可设小值如 32
 num_bins: 1280
 
 ### GRPO 采样
@@ -34,7 +34,7 @@ gradient_checkpointing: true
 dataloader_num_workers: 2
 
 ### 输出/日志
-output_dir: /root/lnj/SpatialLM/saves/grpo_floodnet
+output_dir: /home/aiscuser/nyp/saves/grpo_aircopbench
 logging_steps: 1
 save_steps: 500
 save_total_limit: 2

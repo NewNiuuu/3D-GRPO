@@ -1,0 +1,60 @@
+# SpatialLM GRPO —— AirCopBench（Real2 + Sim，13578 条 / 935 个点云）
+# 环境: /home/aiscuser/miniconda3/envs/spatiallm-grpo (torch 2.7.1+cu126 / transformers 4.53.0)
+# 启动: cd /home/aiscuser/nyp/3D-RL && torchrun --nproc_per_node 8 grpo/train_grpo.py --config grpo/config_aircop.yaml
+
+### 模型（在 SFT 得到的 ckpt 基础上做 RL）
+model_path: /home/aiscuser/nyp/ckpts/point_mixed_downsample
+dtype: bfloat16
+
+### 数据（A/B/C/D 选择题；reward 规则：答对=1，答错或格式崩=0）
+train_json: data/grpo_aircop.json
+max_samples: null          # null=全量；调试可设小值如 64
+num_bins: 1280
+# 点数上限（0=不限）。实测本数据集下采样后 p50 ≈ 2.0k 点、最大不到 6k，
+# 离显存红线很远，不需要设限。（对比 UrbanVideo p50 26k、尾部 22 万）
+max_points: 0
+
+### GRPO 采样
+num_generations: 8         # 组大小 G。越大组内 reward 越容易有方差 -> 有梯度的组更多
+max_new_tokens: 8          # 实测答案就是 1 个字母；给 8 是留余量，比 64 快很多
+temperature: 1.0
+top_p: 1.0
+top_k: 0
+
+### GRPO 目标
+kl_coef: 0.04              # β：KL 惩罚。>0 会再加载一份冻结 ref model（+3.7GB 显存）
+clip_eps: 0.2              # PPO clip ε（num_iterations=1 时不生效）
+num_iterations: 1          # 每批 rollout 更新几次；=1 单步 on-policy
+
+### 训练（8 卡：有效 batch = 8 x per_device x accum = 32 个 prompt = 256 条 rollout）
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+logp_batch_size: 4         # 一次前向算几条序列的 logprob；0=整组一次算完。实测 G=8 一次算完峰值 37GB/40GB 太贴边
+pcd_cache_size: 64         # 点云张量 LRU 条数（AirCop 单文件 ~4MB，可以放宽）
+learning_rate: 1.0e-6
+num_train_epochs: 1
+warmup_ratio: 0.03
+lr_scheduler_type: constant
+gradient_checkpointing: false   # 本机 A100 40G，实测显存够，关掉换速度
+dataloader_num_workers: 4
+seed: 42
+
+### 边下边训（AirCop 4 个 split 合计 5.5GB，已全量落盘，不需要）
+# 若要开：实测 ply 均值 Real2 3.9MB / Sim3 5.9MB / Sim5 9.8MB / Sim6 11.8MB，
+# 整体均值约 5.5MB，window=192 -> 单窗口约 1GB，磁盘峰值约 4GB。
+stream_from_blob: false
+pcd_local_root: /home/aiscuser/nyp/pcdata
+stream_window_files: 192
+stream_prefetch: true
+stream_delete_after: true
+stream_release_lag: 2
+
+### 输出/日志
+output_dir: /home/aiscuser/nyp/saves/grpo_aircop
+logging_steps: 1
+save_steps: 200
+save_total_limit: 3
+report_to: wandb
+wandb_project: spatiallm-grpo
+run_name: aircop-g8-lr1e6
+# max_steps: 20            # 取消注释可限制步数（调试）

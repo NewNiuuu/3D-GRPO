@@ -67,16 +67,28 @@ def preprocess_point_cloud(points, colors, grid_size, num_bins):
     return torch.as_tensor(feat)
 
 
-def load_point_cloud_tensor(pcd_path, num_bins, cleanup=True):
+def load_point_cloud_tensor(pcd_path, num_bins, cleanup=True, max_points=0):
     """
     从路径（本地或 blob 逻辑路径）读点云 -> (N, 9) 张量。
 
     load_o3d_pcd 会自动判断本地/blob（见 pcd_loader）。返回单个点云张量，
     不带 batch 维；batch 维由 trainer 拼接。
+
+    max_points>0 时对超限的点云做**均匀随机下采样**，用来给显存封顶。
+    背景：体素下采样后的点数由场景尺度决定，各数据集差异极大——
+      AirCop      p50 ≈ 2.0k 点
+      UrbanVideo  p50 ≈ 26k、p90 ≈ 59k、尾部见过 22 万点
+    Sonata 是 fp32 且注意力随点数增长，22 万点那种会把 40G A100 打爆。
+    抽样在 CPU 上做，且发生在缓存之前，所以每个文件只抽一次（同一 epoch 内
+    同一份点云对所有 rollout 保持一致，不会给 GRPO 的组内比较引入噪声）。
     """
     pcd = load_o3d_pcd(pcd_path)
     grid_size = Layout.get_grid_size(num_bins)
     if cleanup:
         pcd = cleanup_pcd(pcd, voxel_size=grid_size)
     points, colors = get_points_and_colors(pcd)
-    return preprocess_point_cloud(points, colors, grid_size, num_bins)
+    feat = preprocess_point_cloud(points, colors, grid_size, num_bins)
+    if max_points and feat.shape[0] > max_points:
+        idx = torch.randperm(feat.shape[0])[:max_points]
+        feat = feat[idx.sort().values]  # 保序，别打乱 z-order 序列化的局部性
+    return feat

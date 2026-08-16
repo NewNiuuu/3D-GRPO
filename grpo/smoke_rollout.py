@@ -10,8 +10,8 @@ GRPO 最小试吃 (smoke test) —— 不依赖 trl。
 
 用法:
   python grpo/smoke_rollout.py \
-    --model_path /root/lnj/models/SpatialLM-Qwen3-1.7B-init \
-    --point_cloud /root/points_examples/0be3ceba-DJI_0001.ply \
+    --model_path /home/aiscuser/nyp/ckpts/point_mixed_downsample \
+    --point_cloud /Pointcloud-VQA/AirCopBench/Real2_VQA_train/23-00000001_MDMT_when2col_UAV1_1.ply \
     --num_generations 4
 """
 import os
@@ -29,43 +29,17 @@ import spatiallm  # noqa: F401  注册 spatiallm_qwen3 等自定义模型
 from spatiallm import Layout
 from spatiallm.pcd import load_o3d_pcd, get_points_and_colors, cleanup_pcd, Compose
 
+# 模型加载逻辑与 trainer 共用同一份（处理 transformers 4.x/5.x 的 dtype 参数
+# 差异、以及 meta-device 下 sonata / z-order 的两个坑）。此前这里复制了一份
+# 只支持 dtype= 的版本，在 transformers 4.53 上会报
+# "__init__() got an unexpected keyword argument 'dtype'"。
+from spatiallm_grpo_utils import load_spatiallm
+
 DETECT_TYPE_PROMPT = {
     "all": "Detect walls, doors, windows, boxes.",
     "arch": "Detect walls, doors, windows.",
     "object": "Detect boxes.",
 }
-
-
-def load_spatiallm(model_path, dtype):
-    """
-    在 transformers 5.x 下加载 SpatialLM 自定义模型。
-
-    transformers 5.x 无条件用 meta-device 空壳初始化模型，而 sonata 编码器
-    __init__ 里有 `torch.linspace(...).item()`，meta 张量上调 .item() 会报错。
-    这里在加载期间临时给 Tensor.item 打补丁：meta 张量返回占位 0.0
-    （那行只是算 drop_path 调度值，真实权重加载后会被覆盖，不影响结果）。
-    加载完成后立即还原，不影响任何其它代码。
-    """
-    import torch as _torch
-    _orig_item = _torch.Tensor.item
-
-    def _safe_item(self):
-        return 0.0 if self.is_meta else _orig_item(self)
-
-    _torch.Tensor.item = _safe_item
-    try:
-        model = AutoModelForCausalLM.from_pretrained(model_path, dtype=dtype)
-    finally:
-        _torch.Tensor.item = _orig_item
-
-    # sonata 的 z-order 序列化用一个模块级单例查找表 _key_lut。它若在加载时的
-    # meta-device context 中被首次创建，表内常量会变成 meta 张量，前向时
-    # `.to(device)` 会报 "Cannot copy out of meta tensor"。加载后强制在真实
-    # CPU 上重建一次即可（表是纯常量，重建无副作用）。
-    from spatiallm.model.serialization import z_order as _zo
-
-    _zo._key_lut = _zo.KeyLUT()
-    return model
 
 
 def preprocess_point_cloud(points, colors, grid_size, num_bins):
@@ -185,8 +159,8 @@ def placeholder_reward(text, num_bins):
 
 def main():
     ap = argparse.ArgumentParser("SpatialLM GRPO smoke rollout")
-    ap.add_argument("--model_path", default="/root/lnj/models/SpatialLM-Qwen3-1.7B-init")
-    ap.add_argument("--point_cloud", default="/root/points_examples/0be3ceba-DJI_0001.ply")
+    ap.add_argument("--model_path", default="/home/aiscuser/nyp/ckpts/point_mixed_downsample")
+    ap.add_argument("--point_cloud", default="/Pointcloud-VQA/AirCopBench/Real2_VQA_train/23-00000001_MDMT_when2col_UAV1_1.ply")
     ap.add_argument("--code_template_file", default="code_template.txt")
     ap.add_argument("--detect_type", default="all", choices=["all", "arch", "object"])
     ap.add_argument("--num_generations", type=int, default=4)
