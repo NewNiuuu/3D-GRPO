@@ -172,3 +172,5 @@ saves/
 
 # Local data
 /data/
+# wandb 本地 run 目录
+wandb/

@@ -2,7 +2,7 @@
 
 > 调查日期：2026-08-15，环境就绪与实跑验证：2026-08-16
 > 运行环境：本机 `/home/aiscuser/nyp/3D-RL`，8× A100-SXM4-40GB
-> 结论：**已在本机跑通**。单卡 3 步、四卡 6 步冒烟训练均通过，产出 ckpt 可独立加载。详见[第七节](#七本机就绪状态2026-08-16-实测)。
+> 结论：**已在本机跑通**。AirCop 8 卡（≈4.0 s/it）与 UrbanVideo 单卡均已实训，产出 ckpt 可独立加载。详见[第七节](#七本机就绪状态2026-08-16-实测)。
 
 ---
 
@@ -37,11 +37,11 @@ train_grpo.py  main()
  └─ trainer.save_model()                # 训完存到 output_dir
 ```
 
-启动命令（代码 docstring 里给的）：
+启动命令（完整版见[第八节](#八怎么手动跑起来复制即用)）：
 
 ```bash
-# 多卡
-torchrun --nproc_per_node 4 grpo/train_grpo.py --config grpo/config_test.yaml
+# 多卡（AirCop 主力配置）
+torchrun --nproc_per_node 8 grpo/train_grpo.py --config grpo/config_aircop.yaml
 
 # 单卡调试（只跑 3 步）
 CUDA_VISIBLE_DEVICES=0 python grpo/train_grpo.py --config grpo/config_test.yaml --max_steps 3
@@ -55,7 +55,8 @@ CUDA_VISIBLE_DEVICES=0 python grpo/train_grpo.py --config grpo/config_test.yaml 
 
 ### 第 1 层：YAML —— 唯一需要改的地方
 
-`grpo/config_test.yaml` 是**全部超参的单一来源**。目前仓库里只有这一个 GRPO config。
+YAML 是**全部超参的单一来源**。现有三个：`config_aircop.yaml`（8 卡主力）、
+`config_urbanvideo.yaml`（单卡）、`config_test.yaml`（小样本调试）。
 
 ### 第 2 层：命令行 —— 只有一个 override
 
@@ -77,41 +78,128 @@ YAML 的键在 `main()` 里被拆成两组：
 
 ---
 
-## 三、超参清单与含义
+## 三、训练参数逐条讲解
 
-`grpo/config_test.yaml` 全文 42 行，分 5 组：
+> 这一节是写给**第一次做后训练**的人的。先说一句最重要的：
+> GRPO 和 SFT 的直觉完全不同——SFT 是"照着标准答案抄"，loss 降就是在学；
+> GRPO 是"自己答 G 遍，答对的那几遍加大概率、答错的减小概率"，
+> **loss 恒等于 0 也完全正常**，真正要盯的是 `grpo/accuracy`。
+
+现在有三个配置文件：`config_aircop.yaml`（主力）、`config_urbanvideo.yaml`、
+`config_test.yaml`（小样本调试）。参数分 5 组，逐条说。
+
+### ① 模型
 
 ```yaml
-### 模型
-model_path: /root/lnj/saves/point_mixed_downsample   # ← 必改：SFT ckpt 路径
-dtype: bfloat16
-
-### 数据
-train_json: data/grpo_test.json    # 相对仓库根目录
-max_samples: null                  # 调试设 32，比 --max_steps 更省启动时间
-num_bins: 1280                     # 点云离散化网格数，必须与 SFT 一致
-
-### GRPO 采样
-num_generations: 4                 # G，组大小。太小 advantage 噪声大，太大显存/时间线性涨
-max_new_tokens: 64                 # 选择题答案短，够用
-temperature: 1.0 / top_p: 1.0 / top_k: 0    # 纯采样，不截断分布 → 保证 on-policy 无偏
-
-### GRPO 目标
-kl_coef: 0.04       # β。设 0 可省掉一整份 ref model 显存（约 3.4GB）
-clip_eps: 0.2       # num_iterations=1 时不生效
-num_iterations: 1   # 单步 on-policy；>1 的多步更新尚未实现，调大无效
-
-### 训练
-per_device_train_batch_size: 1     # 每卡每次 1 个 prompt = 1 个 group
-gradient_accumulation_steps: 4
-learning_rate: 1.0e-6              # RL 阶段必须比 SFT(2e-5) 小一到两个量级
-lr_scheduler_type: constant
-gradient_checkpointing: true
+model_path: /home/aiscuser/nyp/ckpts/point_mixed_downsample   # SFT 产出的 ckpt，RL 在它基础上继续训
+dtype: bfloat16                                                # 语言塔精度；点云塔强制 fp32（与推理一致）
 ```
 
-**有效 batch** = 卡数 × `per_device` × `accum`。4 卡时 = 16 个 prompt/step = 64 条 rollout。13578 条数据 ÷ 16 ≈ **849 个 optimizer step/epoch**。
+RL 必须从一个**已经会做这个任务**的 SFT ckpt 出发。从随机权重开始，G 次采样全是
+胡话、reward 全 0、组内没方差 → 一步梯度都产生不了。
 
-调参优先级建议：`learning_rate` > `num_generations` > `kl_coef`。1e-6 已经很保守，可以先照跑。
+### ② 数据
+
+```yaml
+train_json: data/grpo_aircop.json   # 相对仓库根目录
+max_samples: null                   # null=全量；调试填 64，比 --max_steps 更省启动时间
+num_bins: 1280                      # 点云离散化网格数，**必须与 SFT 时一致**，改了等于换了输入分布
+max_points: 0                       # 点数上限，0=不限。见下方说明
+```
+
+`max_points` 是本轮新增的。体素下采样后的点数由场景尺度决定，各数据集差异极大：
+
+| 数据集 | ply 文件均值 | 下采样后点数 |
+|---|---|---|
+| AirCop | 5.5 MB | p50 ≈ 2.0k，最大 < 6k |
+| UrbanVideo | 105 MB | p50 ≈ 26k，p90 ≈ 59k，尾部见过 **22 万** |
+
+点数直接决定点云编码器（Sonata，fp32）的显存。所以 AirCop 设 0（离红线很远），
+UrbanVideo 设 65536（只影响约 6% 的文件，对它们做均匀随机下采样）。
+注意点数**不等于** token 数——5.5 万点编码完只有约 156 个 token 进语言塔。
+
+### ③ GRPO 采样
+
+```yaml
+num_generations: 8    # G，组大小。GRPO 最核心的参数
+max_new_tokens: 8     # 答案就是 1 个字母，给 8 是留余量
+temperature: 1.0      # 纯采样，不动分布
+top_p: 1.0
+top_k: 0
+```
+
+**`num_generations` (G) 是最该理解的一个。** GRPO 对同一道题采样 G 遍，
+用这 G 个 reward 的均值当基线：`A_i = (r_i - mean) / std`。所以：
+
+- G 太小 → 组内很容易 G 遍全对或全错 → `std = 0` → **整组被跳过，一点梯度都没有**
+- G 太大 → 显存和时间线性增长
+
+代码里 `std <= 1e-6` 就 `continue`，这就是为什么 `grpo/frac_nonzero_adv`
+这个指标如此重要——它就是"没被跳过的组占比"。
+
+`temperature: 1.0 / top_p: 1.0 / top_k: 0` 三个别动。截断分布会让采样不再是从
+策略 π_θ 里真正抽样，policy gradient 就有偏了。这是 RL 和推理调参的关键区别：
+**推理时你想要好答案所以截断，RL 采样时你要的是无偏样本。**
+
+### ④ GRPO 目标
+
+```yaml
+kl_coef: 0.04       # β，KL 惩罚强度
+clip_eps: 0.2       # PPO 的 clip 范围
+num_iterations: 1   # 每批 rollout 更新几次
+```
+
+- **`kl_coef`（β）**：拴住策略别跑太远的绳子。训练时会**再加载一份冻结的原始模型**
+  （ref model，约 3.6 GB 显存），每步算策略和它的 KL 散度，加进 loss 当惩罚。
+  调大 = 更保守、更不容易崩，但学得慢。设 0 可以省掉那 3.6 GB，但没了缰绳，
+  模型可能为了骗 reward 输出退化文本（reward hacking）。**新手保持 0.04。**
+- **`clip_eps`**：`num_iterations=1` 时**完全不生效**（下面解释），先别管。
+- **`num_iterations`**：采样一批 rollout 后，拿它做几次梯度更新。
+  `=1` 就是纯 on-policy：采样用的策略 = 更新的策略 → 重要性比 ratio 恒等于 1
+  → clip 永远不触发 → **loss 恒 ≈ 0**。这不是 bug，是数学上的必然（见第五节警告）。
+  本实现只支持 1，调大无效。
+
+### ⑤ 训练
+
+```yaml
+per_device_train_batch_size: 1   # 每卡每次 1 个 prompt = 1 个 group
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-6            # 关键
+num_train_epochs: 1
+warmup_ratio: 0.03
+lr_scheduler_type: constant
+gradient_checkpointing: false    # 本机 40G A100 显存够，关掉换速度
+dataloader_num_workers: 4
+logp_batch_size: 4               # 一次前向算几条序列的 log-prob，0=整组一次算完
+pcd_cache_size: 64               # 点云张量 LRU 缓存条数
+seed: 42
+```
+
+**有效 batch 怎么算**：`卡数 × per_device_train_batch_size × gradient_accumulation_steps`。
+8 卡时 = `8 × 1 × 4` = **32 个 prompt/step**，每个 prompt 采 G=8 遍
+= **256 条 rollout/step**。AirCop 13578 条 ÷ 32 ≈ **424 step/epoch**。
+
+**`learning_rate` 是最该小心的一个。** RL 阶段必须比 SFT 小**一到两个量级**
+（SFT 用 2e-5，这里用 1e-6）。原因：SFT 有标准答案兜底，学偏了也偏不到哪去；
+RL 的 reward 信号又稀疏又嘈杂（一个 0/1 标量要指导整个序列），
+lr 一大策略立刻崩，而且**崩了不可逆**——采样分布坏了以后再也采不到好样本。
+症状就是 `grpo/kl` 飙升。调参优先级：`learning_rate` > `num_generations` > `kl_coef`。
+
+`logp_batch_size` 和 `pcd_cache_size` 是纯工程参数，不影响训练结果，只影响显存/速度。
+`warmup_ratio: 0.03` + `constant` 表示前 3% 步线性升到 1e-6 然后一直保持。
+
+### ⑥ 输出与日志
+
+```yaml
+output_dir: /home/aiscuser/nyp/saves/grpo_aircop
+logging_steps: 1
+save_steps: 200          # 每 200 步存一个 ckpt
+save_total_limit: 3      # 最多留 3 个，自动删旧的
+report_to: wandb
+wandb_project: spatiallm-grpo
+run_name: aircop-g8-lr1e6
+```
+
 
 ---
 
@@ -150,10 +238,10 @@ HF Trainer 接管：backward → 累积 4 步 → optimizer.step()
 ### 产物文件（`output_dir`）
 
 ```
-saves/grpo_floodnet/
-├── checkpoint-500/          # save_steps=500，849 步/epoch 会存 1 个
+saves/grpo_aircop/
+├── checkpoint-200/          # save_steps=200，424 步/epoch 会存 2 个（save_total_limit=3 自动删旧）
 ├── config.json
-├── model.safetensors        # 训完 save_model() 存的全量权重（非 LoRA，约 3.4GB）
+├── model.safetensors        # 训完 save_model() 存的全量权重（非 LoRA，约 3.6GB）
 ├── tokenizer.json / ...
 └── trainer_state.json       # 完整日志历史，事后画曲线用这个
 ```
@@ -171,18 +259,20 @@ saves/grpo_floodnet/
 ```
 {'grpo/mean_reward': 0.5,  'grpo/accuracy': 0.5,   'grpo/reward_std': 0.577,
  'grpo/kl': 0.0,           'grpo/completion_len': 3.0,
- 'grpo/frac_nonzero_adv': 1.0, 'grpo/updated_microbatches': 7.0}
+ 'grpo/frac_nonzero_adv': 1.0, 'grpo/skipped_groups': 1.0, 'grpo/mem_gb': 21.68}
 ```
 
 ### 各字段该期待什么值
 
 | 字段 | 期望 | 说明 |
 |---|---|---|
-| `grpo/accuracy` | 起点 = SFT 在这批题上的准确率；**应缓慢上升** | **唯一真正的效果指标** |
+| `grpo/accuracy` | 起点 = SFT 在这批题上的准确率（AirCop ≈ 0.86，UrbanVideo ≈ 0.80）；**应缓慢上升** | **唯一真正的效果指标** |
 | `grpo/frac_nonzero_adv` | 0.3~0.7 | 有多少组产生了学习信号。若 <0.1 说明题目太简单或太难，GRPO 学不动 |
 | `grpo/kl` | 从 0 缓慢上升 | 若飙升（>0.5）说明策略跑偏，该调小 lr 或调大 kl_coef |
-| `grpo/completion_len` | 2~5 | 选择题答案就几个 token。若接近 64 说明模型在胡扯没吐 EOS |
-| `grpo/reward_std` | 0/1 reward + G=4 下只能取 {0, 0.5, 0.577} | 全对/全错时为 0 |
+| `grpo/completion_len` | 1~2 | 选择题答案就 1 个字母。若接近 `max_new_tokens` 说明模型在胡扯没吐 EOS |
+| `grpo/reward_std` | 0/1 reward 下的离散取值 | 全对/全错时为 0，该组会被跳过 |
+| `grpo/skipped_groups` | 本步被跳过的组数 | 与 `frac_nonzero_adv` 互为补充 |
+| `grpo/mem_gb` | 稳定在一个平台值 | 前几步会从 10 GB 爬到 21.7 GB（梯度和优化器状态逐步分配），**之后应该持平**。持续上涨才是异常 |
 | `loss` | **≈ 0，且没有意义** | 见下方警告 |
 
 > ⚠️ **别看 loss 曲线。** `num_iterations=1` 时 ratio ≡ 1，per-token loss = −A_g；而组内 advantage 之和恒为 0，所以 `loss_sum` 天然接近 0（只有各条长度不等时才有微小偏离）。**loss 不降不代表没在学**，GRPO 的 loss 是个 surrogate，请只盯 `grpo/accuracy` 和 `grpo/kl`。
@@ -261,78 +351,224 @@ SONATA 分支（`spatiallm_qwen3.py:132`）。
 
 ### ③ 点云数据 ✅
 
-| | |
-|---|---|
-| blob | `Pointcloud-VQA/AirCopBench/{Real2,Sim3,Sim5,Sim6}_VQA_train` |
-| 本地 | `/home/aiscuser/nyp/pcdata/Pointcloud-VQA/AirCopBench/...` |
-| 符号链接 | `/Pointcloud-VQA -> /home/aiscuser/nyp/pcdata/Pointcloud-VQA` |
+| 数据集 | blob 路径（相对 `output/liyan`） | 本地 |
+|---|---|---|
+| AirCop | `Pointcloud-VQA/AirCopBench/{Real2,Sim3,Sim5,Sim6}_VQA_train` | `/home/aiscuser/nyp/pcdata/Pointcloud-VQA/AirCopBench/...` |
+| UrbanVideo | `Pointcloud-VQA/UrbanVideoBench/train_64` | `/home/aiscuser/nyp/pcdata/Pointcloud-VQA/UrbanVideoBench/train_64` |
 
-935 个 `.ply`，5.41 GiB，与 `grpo_test.json` 引用的唯一点云数**完全一致**。
-靠上面那个符号链接，JSON 里的绝对路径原样解析，**无需改任何数据文件**。
+符号链接 `/Pointcloud-VQA -> /home/aiscuser/nyp/pcdata/Pointcloud-VQA`，
+JSON 里的绝对路径原样解析，**无需改任何数据文件**。
 
-`python grpo/check_data.py --read` 全部 935 个文件用 open3d 实读通过，0 缺失 0 损坏。
+AirCop 935 个 `.ply`（5.41 GiB），`python grpo/check_data.py --read` 用 open3d 实读全部通过，0 缺失 0 损坏。
+UrbanVideo 1159 个 `.ply`（118.5 GiB）。磁盘吃紧时可改用第九节的边下边训。
 
-### ④ 显存 ✅（其他进程已停）
+### ④ 显存 ✅
 
-8 张卡全空（每张 40441 MiB）。四卡实测峰值远低于上限，全量 AdamW 可跑。
-若日后卡被占用，可用 `optim: adamw_bnb_8bit`（已在 `train_grpo.py` 加好透传）
-或 `kl_coef: 0`（省掉整份 ref model）。
+8 张卡各 40441 MiB。AirCop 8 卡实测平台 **21.7 GB**，余量充足。
+UrbanVideo 单卡峰值 **28.3 GB**，8 卡会 OOM（详见"附：已知限制"）。
 
 ### ⑤ 学习信号 ✅（正式训练前最该看的一项）
 
-新增 `grpo/probe_signal.py`，32 个真实 prompt × G=4 的采样结果：
+`grpo/probe_signal.py` 在两个数据集上的实测：
 
-| 指标 | 实测 | 说明 |
+| 指标 | AirCop (n=32, G=4) | UrbanVideo (n=48, G=8) |
 |---|---|---|
-| `accuracy` | **0.859** | SFT 起点准确率 |
-| `frac_nonzero_adv` | **0.344** | 能产生梯度的 group 占比，健康 |
-| `parse_fail_rate` | 0.000 | 格式完全没崩 |
-| `mean_completion_len` | 1.0 token | 模型直接吐单个字母 |
+| `accuracy` | **0.859** | **0.802** |
+| `frac_nonzero_adv` | **0.344** | **0.333** |
+| `parse_fail_rate` | 0.000 | 0.000 |
+| `mean_completion_len` | 1.0 token | 1.0 token |
 
-由于输出就是**单个字母**，附录里担心的"兜底正则 `\b([ABCD])\b` 误命中散文"
-在本数据集上不成立。
+两者结论都是"学习信号充足，可以开训"。UrbanVideo 的 GT 覆盖 A/B/C/D/E/G，
+模型预测覆盖 A–G，`reward.py` 放宽到 A–H 后解析零失败。
+
+由于输出就是**单个字母**，附录里担心的"兜底正则误命中散文"在这两个数据集上都不成立。
 
 ### ⑥ 冒烟训练 ✅
 
 ```
 单卡 3 步：step1 grad_norm=23.97，成功产出 ckpt
-四卡 6 步：6/6 步 grad_norm 均非零（10.7~35.2），无 DDP 挂起
+八卡 14 步（AirCop）：grad_norm 全程非零，accuracy 0.875 / 0.844 / 0.813，显存平台 21.68 GB
+单卡（UrbanVideo）：accuracy 0.75 / 0.906，峰值 28.33 GB
 产出 ckpt 已验证可独立 from_pretrained 加载（1.830 B）
 ```
 
-四卡约 **6.2 s/step**，有效 batch 16 prompt = 64 rollout。
-13578 条 ÷ 16 ≈ 849 step/epoch → **单 epoch 约 90 分钟**。
+AirCop 8 卡 **≈ 4.0 s/it**（点云编码共享修复前是 9.0 s/it），有效 batch 32 prompt = 256 rollout。
+13578 条 ÷ 32 ≈ 424 step/epoch → **单 epoch 约 30 分钟**。
 
 单卡时会出现整步 `grad_norm=0.0`（4 个 micro-batch 全被 `std<=1e-6` 跳过），
-属正常现象；四卡下 16 个 group 里几乎总有带信号的，未再出现。
+属正常现象；多卡下 32 个 group 里几乎总有带信号的，未再出现。
 
 ---
 
-## 八、建议的启动顺序
+## 八、怎么手动跑起来（复制即用）
+
+所有命令都**先进仓库根目录**。`grpo/train_grpo.py` 是相对路径，
+在 `grpo/` 目录里执行会变成 `grpo/grpo/train_grpo.py` 而报 "can't open file"。
 
 ```bash
 cd /home/aiscuser/nyp/3D-RL
-source ~/miniconda3/etc/profile.d/conda.sh && conda activate spatiallm-grpo
-
-# 1) 数据链路（不需要模型，最快）
-python grpo/check_data.py            # 加 --read 会用 open3d 实读每个文件
-
-# 2) 点云透传 + 采样 + 重算 log-prob（不需要数据集）
-CUDA_VISIBLE_DEVICES=0 python grpo/smoke_rollout.py --num_generations 4 --max_new_tokens 64
-
-# 3) 学习信号体检 —— 正式开训前最该看的一步
-CUDA_VISIBLE_DEVICES=0 python grpo/probe_signal.py -n 32
-
-# 4) 单卡 3 步冒烟
-CUDA_VISIBLE_DEVICES=0 python grpo/train_grpo.py --config grpo/config_test.yaml --max_steps 3
-
-# 5) 四卡正式跑
-torchrun --nproc_per_node 4 grpo/train_grpo.py --config grpo/config_test.yaml
 ```
 
-第 1、2 步是作者专门写来分段排障的，**别跳过**——它们能把"环境问题 / 数据问题 / 模型问题"三者隔离开。
-第 3 步是本次新增的：GRPO 的梯度全部来自组内 reward 方差，`frac_nonzero_adv` 过低时
-训练能跑完但一步都学不到东西，事前 2 分钟就能测出来。
+另外：**别用系统的 `torchrun`**（会 `ModuleNotFoundError: No module named 'transformers'`），
+要么先 `conda activate spatiallm-grpo`，要么直接写绝对路径
+`/home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/torchrun`。下面统一用绝对路径，最不容易出错。
+
+### 0) 一次性准备：wandb 登录
+
+```bash
+/home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/wandb login
+```
+
+粘贴 https://wandb.ai/authorize 的 token，存进 `~/.netrc`，以后不用再登。
+机器连不上外网就在 config 里加 `wandb_offline: true`，事后 `wandb sync` 补传。
+
+### 1) 开训前的两分钟体检（强烈建议）
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/python \
+  grpo/probe_signal.py --config grpo/config_aircop.yaml -n 32
+```
+
+看 `frac_nonzero_adv`：低于 0.1 就别开训了，跑一整天也学不到东西。
+（UrbanVideo 实测 n=48 时 accuracy 0.802 / frac_nonzero_adv 0.333，健康。）
+
+### 2) AirCop —— 8 卡正式训练（**主力配置，已验证**）
+
+```bash
+cd /home/aiscuser/nyp/3D-RL && \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/torchrun --nproc_per_node 8 \
+  grpo/train_grpo.py --config grpo/config_aircop.yaml
+```
+
+实测 **≈ 4.0 s/it**，显存平台 21.7 GB / 40 GB，有效 batch 32 prompt = 256 rollout，
+13578 条 ÷ 32 ≈ **424 step/epoch**，单 epoch 约 30 分钟。
+
+### 3) UrbanVideo —— **单卡**（8 卡会 OOM，见第九节）
+
+```bash
+cd /home/aiscuser/nyp/3D-RL && \
+CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/python \
+  grpo/train_grpo.py --config grpo/config_urbanvideo.yaml
+```
+
+实测峰值 28.33 GB / 40 GB。
+
+### 4) 挂后台跑 + 看日志
+
+两种都行，推荐 tmux（可以随时回去看实时输出、Ctrl-C 也方便）。
+
+**tmux：**
+
+```bash
+tmux new -s grpo                      # 建会话
+# —— 在会话里粘上面第 2 步的命令 ——
+# Ctrl-B 然后按 D 脱离，训练继续跑
+tmux attach -t grpo                   # 随时回来看
+tmux ls                               # 看有哪些会话
+```
+
+**nohup（不想装/学 tmux 时）：**
+
+```bash
+mkdir -p ~/nyp/logs
+cd /home/aiscuser/nyp/3D-RL && \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+nohup /home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/torchrun --nproc_per_node 8 \
+  grpo/train_grpo.py --config grpo/config_aircop.yaml \
+  > ~/nyp/logs/aircop.log 2>&1 &
+echo $!                               # 记下 PID，要停就 kill 它
+```
+
+监控：
+
+```bash
+tail -f ~/nyp/logs/aircop.log         # 实时日志
+grep grpo/accuracy ~/nyp/logs/aircop.log | tail -20   # 只看准确率
+nvitop                                # 看显存/利用率
+```
+
+wandb 网页端会实时出曲线（项目 `spatiallm-grpo`，run 名就是 config 里的 `run_name`）。
+**盯 `grpo/accuracy`，不要盯 loss**——理由见第五、六节。
+
+要停止：
+
+```bash
+pkill -f train_grpo.py                # torchrun 会拉起 8 个子进程，按脚本名杀干净
+```
+
+### 5) 断点续训
+
+`save_steps` 到点会在 `output_dir` 下写 `checkpoint-<step>/`（只留最近 3 个）。
+崩了或手动停了之后，在原命令后加一个参数即可从断点继续，
+优化器状态、lr schedule、数据顺序都会恢复：
+
+```bash
+cd /home/aiscuser/nyp/3D-RL && \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/torchrun --nproc_per_node 8 \
+  grpo/train_grpo.py --config grpo/config_aircop.yaml \
+  --resume_from_checkpoint /home/aiscuser/nyp/saves/grpo_aircop/checkpoint-200
+```
+
+### 6) 分段排障（跑不起来时按顺序试）
+
+```bash
+python grpo/check_data.py                        # 只查数据链路，不加载模型；--read 用 open3d 实读
+CUDA_VISIBLE_DEVICES=0 python grpo/smoke_rollout.py --num_generations 4   # 只测采样，不要数据集
+CUDA_VISIBLE_DEVICES=0 python grpo/train_grpo.py --config grpo/config_test.yaml --max_steps 3
+```
+
+这三步专门用来把"环境问题 / 数据问题 / 模型问题"隔离开，别跳过。
+
+
+---
+
+## 九、边下边训（stream_from_blob）
+
+点云数据总量很大（UrbanVideo 一个数据集就 118.5 GB），全量拉到本地既慢又占盘。
+`grpo/blob_stream.py` 实现了 **下一批 → 训一批 → 删一批** 的流式采样器。
+数据已经落盘时保持 `stream_from_blob: false` 即可，两条路径可随时切换。
+
+### 怎么开
+
+```yaml
+stream_from_blob: true
+pcd_local_root: /home/aiscuser/nyp/pcdata
+stream_window_files: 24     # 每个窗口下载多少个 ply
+stream_prefetch: true       # 后台线程预取下一窗口，把下载时间藏进训练时间
+stream_delete_after: true   # 窗口训完就删（只删本进程下载的文件）
+stream_release_lag: 2       # 滞后 2 个窗口再删，防止预取/训练错位时误删
+```
+
+### 它是怎么工作的
+
+按点云文件分组打乱（webdataset 风格的两级 shuffle）：
+文件级先 shuffle → 取 `window_files` 个文件构成一个窗口 → 窗口内的样本再 shuffle。
+这样既保证随机性，又保证同一时刻只有少数几个 ply 需要在盘上。
+磁盘峰值 ≈ `(release_lag + 2) × window_files × 单文件大小`。
+
+多卡时窗口按 rank 切分，每个 rank 只下载自己那份，不重复。
+
+### 为什么每个数据集的 window 不一样
+
+`stream_window_files` 不能取一个通用值——各数据集单文件大小差 30 倍。实测：
+
+| 数据集 | 文件数 | 单文件均值 | 合计 | `stream_window_files` | 单窗口 | 磁盘峰值 |
+|---|---|---|---|---|---|---|
+| AirCop | 935 | 5.5 MB | 5.4 GB | **192** | ≈ 1.1 GB | ≈ 4 GB |
+| UrbanVideo | 1159 | 104.7 MB（p50 124.8） | 118.5 GB | **24** | ≈ 2.5 GB | ≈ 10 GB |
+
+原则：**让单窗口落在 1~3 GB**。窗口太小 → shuffle 退化成近似顺序读，
+同一窗口内样本高度相关，梯度有偏；窗口太大 → 磁盘占用逼近全量，等于没做流式。
+换新数据集时先量一下文件大小分布再定这个数，别照抄。
+
+### 注意
+
+- 下载凭据从 `~/.blob_config.json` 读（SAS token），脚本刻意不把 URL 打进错误信息，避免 token 进日志。
+- `stream_delete_after` 只删本进程下载的文件；手动预先放好的数据不会被误删。
+- 预取线程失败时会退化成同步下载并打警告，不会静默跳过样本。
 
 ---
 
@@ -340,20 +576,28 @@ torchrun --nproc_per_node 4 grpo/train_grpo.py --config grpo/config_test.yaml
 
 调查过程中发现的、与"能否跑出效果"相关的设计限制，供调参时参考：
 
+- **UrbanVideo 上不了多卡**（本轮实测）：单卡峰值 28.3 GB 可跑，8 卡稳定 OOM 在约 38 GB。
+  静态占用（权重 + ref + 梯度 + 优化器状态）爬坡到 21.7 GB 后，点云编码器的激活尖峰
+  再叠 DDP 梯度桶就顶穿 40 GB。**已试过且无效**：`max_points` 65536→16384、
+  `num_generations` 8→4、`adamw_bnb_8bit`、`gradient_checkpointing`、`expandable_segments`
+  ——峰值都稳在 38 GB。真要上多卡得砍掉编码器激活本身（冻结点云塔，或让它走 bf16），
+  这会改动 SFT 共用的模型代码，本轮没做。
 - **`num_iterations: 1` 是单步 on-policy**，ratio 恒为 1，`clip_eps` 永不触发。多步更新（复用 rollout 做多次梯度更新）尚未实现，调大该值无效。
-- **reward 仅支持 A/B/C/D 选择题**（`reward.py` 全文只有 `[ABCD]` 正则）。grounding / bbox 任务喂进来会全部拿 0 分 → 整组被 `std<=1e-6` 跳过 → 一步梯度都不产生。grounding 目前只有 SFT（`configs/spatiallm_grounding.yaml`）。
-- **`tok_total` 未跨卡同步**（`grpo_trainer.py:342`）：各卡回答长短不一导致分母不同，DDP 梯度平均后等价于给不同卡的 token 赋了不同权重。
-- **整批被跳过时返回与模型无关的 0 loss**（`grpo_trainer.py:336-338`），该卡无参数进入计算图，配合 `ddp_find_unused_parameters=True` 在多卡下有挂起风险。
-- **采样效率**：每个 group 做 1 次 generate + G 次 policy forward + G 次 ref forward，全部 batch=1 逐条跑。G=4 时是 9 次前向，可通过 padding 成 batch 提速约 4 倍。
+- **reward 只支持单选题**（`reward.py` 的 `CHOICES` 现已放宽到 A–H，覆盖 AirCop 的 A–D 和 UrbanVideo 的 A–G）。grounding / bbox 任务喂进来会全部拿 0 分 → 整组被 `std<=1e-6` 跳过 → 一步梯度都不产生。grounding 目前只有 SFT（`configs/spatiallm_grounding.yaml`）。
+- **`tok_total` 未跨卡同步**：各卡回答长短不一导致分母不同，DDP 梯度平均后等价于给不同卡的 token 赋了不同权重。
+- **整批被跳过时返回与模型无关的 0 loss**，该卡无参数进入计算图，配合 `ddp_find_unused_parameters=True` 在多卡下有挂起风险。
+  （`ddp_find_unused_parameters=False` 不能开：零方差组会跳过整个 micro-batch，确实会留下没有梯度的参数。）
 - **advantage 除以 std** 会引入难度偏置（简单题 std 小 → advantage 被放大），Dr.GRPO 建议只减均值。
-- **reward 兜底正则 `\b([ABCD])\b`** 理论上可能误命中，例如 "A UAV should collaborate" 里的 "A"。
+- **reward 兜底正则** 理论上可能误命中，例如 "A UAV should collaborate" 里的 "A"。
   已用 `probe_signal.py` 实测：本 ckpt 输出就是**单个字母**（平均 1.0 token），
-  `parse_fail_rate=0`，没有散文可供误命中，**本数据集上不成立**。换数据集或改 prompt
+  `parse_fail_rate=0`，没有散文可供误命中，**两个数据集上都不成立**。换数据集或改 prompt
   导致模型开始输出完整句子时，需重新体检。
 
 ---
 
 ## 附二：本次为适配本机所做的代码改动
+
+### 第一轮：跑通
 
 | 文件 | 改动 |
 |---|---|
@@ -363,3 +607,20 @@ torchrun --nproc_per_node 4 grpo/train_grpo.py --config grpo/config_test.yaml
 | `grpo_trainer.py` | **把 tokenizer 转发给 HF Trainer 的 `processing_class`**——此前 tokenizer 被吞进 `self._tok`，导致存出的 ckpt 只有 `model.safetensors` 而没有 `tokenizer.json` / `vocab.json` / `merges.txt`，无法直接 `from_pretrained` |
 | `check_data.py` | 新增本地模式（`--mode auto/local/blob`）与 `--read` 实读校验；原版只能查 blob |
 | `probe_signal.py` | 新增：开训前的学习信号体检 |
+
+### 第二轮：wandb / 提速 / 两个新数据集 / 边下边训
+
+| 文件 | 改动 |
+|---|---|
+| `grpo_trainer.py` | **`_share_point_encoding`**：`spatiallm_qwen3.forward` 对 batch 里每个元素单独调 `forward_point_cloud`，而一个 group 的 G 条序列共用同一片点云 → 同一朵云被重复编码 G 次。加了个 memo 上下文管理器让组内共享一次编码结果。**这是本轮最重要的改动**：AirCop 从 9.0 s/it 降到 **4.0 s/it**，UrbanVideo 从 OOM 变成单卡可跑（5.5 万点：generate 5.00 GB / 前向+反向 14.34 GB） |
+| `grpo_trainer.py` | ref model 改为在 `__init__` 里就搬上卡。原来惰性搬迁的时机恰好是策略前向图还挂着的显存最高点，那时再要 3.6 GB 常常正好 OOM |
+| `grpo_trainer.py` | 新增 `max_points` 参数；`_flush_logs` 新增 `grpo/mem_gb` 指标 |
+| `grpo_trainer.py` | `_logprobs_chunked` 把共享上下文开在分块循环**外面**，否则分块之间又重复编码 |
+| `spatiallm_grpo_utils.py` | `load_point_cloud_tensor` 新增 `max_points`：超限时做均匀随机下采样，且**保序**（不打乱 z-order 序列化的局部性） |
+| `reward.py` | `CHOICES` 从 `[ABCD]` 放宽到 `[A-H]`，支持 UrbanVideo 的 A–G |
+| `config_aircop.yaml` | 新增：AirCop 8 卡主力配置（`max_points: 0`，`stream_window_files: 192`） |
+| `config_urbanvideo.yaml` | 新增：UrbanVideo 单卡配置（`max_points: 65536`，`stream_window_files: 24`），header 记录了 OOM 现状与所有试过无效的办法 |
+| `blob_stream.py` | 新增：边下边训采样器（文件级 shuffle + 窗口内 shuffle + 预取 + 滞后删除） |
+| `train_grpo.py` | 透传 `max_points` / `stream_sampler`；wandb 环境变量提前注入；训练结束打印峰值显存 |
+| `.gitignore` | 追加 `wandb/` |
+

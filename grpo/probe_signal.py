@@ -66,6 +66,7 @@ def main():
     ds = FloodnetGRPODataset(cfg["train_json"], max_samples=None)
     G = cfg.get("num_generations", 4)
     num_bins = cfg.get("num_bins", 1280)
+    max_points = cfg.get("max_points", 0)   # 与训练一致地给点数封顶
 
     # 均匀抽样，避免只覆盖单一子集
     step = max(len(ds) // args.num_prompts, 1)
@@ -78,7 +79,7 @@ def main():
 
     for k, i in enumerate(idxs):
         s = ds[i]
-        pcd = load_point_cloud_tensor(s["pcd_path"], num_bins).unsqueeze(0).to("cuda")
+        pcd = load_point_cloud_tensor(s["pcd_path"], num_bins, max_points=max_points).unsqueeze(0).to("cuda")
         conv = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": s["prompt_text"]},

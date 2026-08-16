@@ -2,12 +2,14 @@
 """
 SpatialLM GRPO 训练入口（HF Trainer + 自定义 GRPO loss）。
 
-四卡启动示例（在 spatiallm-grpo 环境）：
+八卡启动示例（在 spatiallm-grpo 环境）：
     cd /home/aiscuser/nyp/3D-RL
-    torchrun --nproc_per_node 4 grpo/train_grpo.py --config grpo/config_test.yaml
+    torchrun --nproc_per_node 8 grpo/train_grpo.py --config grpo/config_aircop.yaml
 
 单卡快速验证：
     CUDA_VISIBLE_DEVICES=0 python grpo/train_grpo.py --config grpo/config_test.yaml --max_steps 3
+
+完整命令（含后台训练与监控）见 grpo/README.md 第八节。
 """
 import os
 import sys
