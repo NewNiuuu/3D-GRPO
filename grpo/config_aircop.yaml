@@ -55,6 +55,9 @@ logging_steps: 1
 save_steps: 200
 save_total_limit: 3
 report_to: wandb
-wandb_project: spatiallm-grpo
+# 按数据集分项目：AirCop 和 UrbanVideo 各自一个面板，永远不会混在一起。
+# run 名会由 train_grpo.py 自动追加时间戳（aircop-g8-lr1e6-0817-2130），
+# 所以同一数据集训多次也分得清，且能在同一面板里叠着比。
+wandb_project: spatiallm-grpo-aircop
 run_name: aircop-g8-lr1e6
 # max_steps: 20            # 取消注释可限制步数（调试）

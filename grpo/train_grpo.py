@@ -15,6 +15,7 @@ import os
 import sys
 import argparse
 import logging as _logging
+from datetime import datetime
 
 import torch
 import yaml
@@ -68,6 +69,13 @@ def main():
         for k in ("WANDB_RUN_ID", "WANDB_RESUME", "WANDB_RUN_GROUP", "WANDB_NOTES"):
             os.environ.pop(k, None)
         if cfg.get("run_name"):
+            # run 名自动加时间戳，保证**每次启动在 wandb 里都是一条独立、可区分的条目**。
+            # 不加的话每次都叫 "urbanvideo-g8-lr1e6"，面板里一排同名 run，
+            # 只能靠创建时间猜是哪一次——这正是之前搞混的原因之一。
+            # （只有 rank0 会往 wandb 写，各 rank 时间戳差一分钟也没有影响）
+            cfg["run_name"] = "{}-{}".format(
+                cfg["run_name"], datetime.now().strftime("%m%d-%H%M")
+            )
             os.environ["WANDB_NAME"] = cfg["run_name"]
         else:
             os.environ.pop("WANDB_NAME", None)

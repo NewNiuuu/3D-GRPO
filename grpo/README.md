@@ -313,10 +313,20 @@ saves/grpo_aircop/
 
 ```yaml
 report_to: wandb
-wandb_project: spatiallm-grpo     # 项目名（train_grpo.py 会写进 WANDB_PROJECT）
-run_name: aircop-g8-lr1e6         # 这次 run 的名字，wandb 里就显示它
-# wandb_offline: true             # 机器连不上外网时改这个，事后 wandb sync 上传
+wandb_project: spatiallm-grpo-aircop   # 项目名（train_grpo.py 会写进 WANDB_PROJECT）
+run_name: aircop-g8-lr1e6              # run 名，启动时会自动追加时间戳
+# wandb_run_id: xxxx                   # 只在想续跑某个已有 run 时才填
+# wandb_offline: true                  # 机器连不上外网时改这个，事后 wandb sync 上传
 ```
+
+**一次训练 = 一条独立的 wandb 条目**，靠两层保证：
+
+| 层级 | 取值 | 作用 |
+|---|---|---|
+| project（面板） | `spatiallm-grpo-aircop` / `spatiallm-grpo-urbanvideo` | 两个数据集各一个面板，**永远不会混**。两者的 accuracy 基线本来就不可比（4 选 1 vs 7 选 1），没有放一起的必要 |
+| run（条目） | `urbanvideo-g8-lr1e6-0817-0812` | `train_grpo.py` 自动给 `run_name` 追加 `%m%d-%H%M`。同一数据集训多次也分得清是哪一次，且能在同一面板里叠着比 |
+
+run id 则每次由 wandb 随机生成（**前提是 `WANDB_RUN_ID` 已被清掉**，见下方警告）。
 
 首次使用要先登录一次（只需一次，token 存进 `~/.netrc`）：
 
@@ -350,7 +360,7 @@ wandb 会自动读 `WANDB_RUN_ID`，于是**每次启动训练都挂到同一个
 已经被污染的本地 run 数据不会丢，训练结束后可以重新灌进一个干净的 run：
 
 ```bash
-wandb sync wandb/run-<时间戳>-<旧id> --id <随便起个新id> -p spatiallm-grpo
+wandb sync wandb/run-<时间戳>-<旧id> --id <随便起个新id> -p spatiallm-grpo-urbanvideo
 ```
 
 **wandb 上该盯哪几条曲线**（按重要性排序）：
