@@ -4,6 +4,7 @@ Floodnet GRPO 数据集。
 
 每条样本产出一个 dict：
     {
+        "idx": <在原始 json 里的下标，难度打标时用来定位题目>,
         "pcd_path": <点云逻辑路径，blob 或本地>,
         "prompt_text": <拼好 point-token 占位符的用户问句>,
         "answer": <GT 答案字符串，供 reward 使用>,
@@ -60,6 +61,7 @@ class FloodnetGRPODataset(Dataset):
         pcd_path = s["point_clouds"][0]
 
         return {
+            "idx": idx,          # 原始 json 里的下标，用于难度打标时定位到具体题目
             "pcd_path": pcd_path,
             "prompt_text": question,
             "answer": answer,

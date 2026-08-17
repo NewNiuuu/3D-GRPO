@@ -21,6 +21,8 @@ from typing import List
 from collections import OrderedDict
 from contextlib import contextmanager
 import functools
+import json
+import os
 
 import torch
 import torch.nn.functional as F
@@ -44,6 +46,7 @@ class _StreamEpochCallback(TrainerCallback):
 def grpo_collate(batch):
     """把 dataset 的样本按原样打包成 list（点云在 compute_loss 里惰性加载）。"""
     return {
+        "idx": [b.get("idx", -1) for b in batch],
         "pcd_path": [b["pcd_path"] for b in batch],
         "prompt_text": [b["prompt_text"] for b in batch],
         "answer": [b["answer"] for b in batch],
@@ -70,6 +73,7 @@ class SpatialLMGRPOTrainer(Trainer):
         pcd_cache_size: int = 32,
         max_points: int = 0,
         stream_sampler=None,
+        difficulty_log: bool = False,
         **kwargs,
     ):
         # tokenizer 同时交给 HF Trainer（processing_class），否则 save_model /
@@ -111,6 +115,23 @@ class SpatialLMGRPOTrainer(Trainer):
         # 累计计数（单调递增，跨 step 保留）：有多少个 micro-batch 产生了非零梯度。
         # frac_nonzero_adv 是每步瞬时比例，这个是"到目前为止累计更新次数"。
         self._updated_microbatches = 0
+
+        # ---- 难度打标 ----
+        # 训练本身就要对每个 prompt 采 G 条 rollout 并逐条判对错，这份信息原来只被
+        # 聚合成 accuracy 就扔了。打开后额外把**每个 group 的逐题结果**落盘，
+        # 于是跑一遍训练顺带得到一份全数据集的难度图谱，供下一轮做难题筛选。
+        # 开销：每个 group 一行 json，纯 CPU，无同步，可忽略。
+        #
+        # 每个 rank 写自己的文件，不加锁——8 个进程往同一文件追加会交错撕裂。
+        # 聚合交给 grpo/analyze_difficulty.py。
+        self._diff_fp = None
+        if difficulty_log:
+            d = os.path.join(self.args.output_dir, "difficulty")
+            os.makedirs(d, exist_ok=True)
+            self._diff_fp = open(
+                os.path.join(d, f"rank{self.args.process_index}.jsonl"),
+                "a", buffering=1,          # 行缓冲：训练中途看/中途崩都能拿到已写的部分
+            )
         # EOS：真正的对话结束符（Qwen 为 <|im_end|>）。completion mask 以此截断，
         # 之后的 pad token 不计入 loss / KL。
         self.eos_token_id = tokenizer.eos_token_id if tokenizer is not None else None
@@ -506,6 +527,7 @@ class SpatialLMGRPOTrainer(Trainer):
         prompt_texts = inputs["prompt_text"]
         pcd_paths = inputs["pcd_path"]
         answers = inputs["answer"]
+        idxs = inputs.get("idx") or [-1] * len(prompt_texts)
 
         # 按「总有效 token 数」归一（DAPO/Dr.GRPO 式）：累加所有 group / 段 / 有效
         # token 的 loss 项，最后除以有效 token 总数。CoT 变长时每 token 权重一致。
@@ -514,7 +536,9 @@ class SpatialLMGRPOTrainer(Trainer):
         acc = self._log_accum
 
         # 逐个 prompt 处理（每个 prompt 是一个 GRPO group）
-        for prompt_text, pcd_path, answer in zip(prompt_texts, pcd_paths, answers):
+        for prompt_text, pcd_path, answer, item_idx in zip(
+            prompt_texts, pcd_paths, answers, idxs
+        ):
             acc["n_groups_seen"] += 1
             pcd = self._load_pcd(pcd_path).to(device)
             pcd_batched = pcd.unsqueeze(0)  # (1, N, 9)
@@ -539,6 +563,31 @@ class SpatialLMGRPOTrainer(Trainer):
             acc["reward"] += rewards.mean().item()
             acc["reward_std"] += std.item()
             acc["acc"] += (rewards == 1.0).float().mean().item()
+
+            # (3a) 难度打标：必须写在下面 continue 之前。
+            # 被 std<=1e-6 跳过的组正是「G 条全对」和「G 条全错」两类——
+            # 也就是最该被标记的"太简单"和"太难"，写在 continue 之后就全丢了。
+            if self._diff_fp is not None:
+                n_ok = int((rewards == 1.0).sum().item())
+                self._diff_fp.write(
+                    json.dumps(
+                        {
+                            "idx": int(item_idx),
+                            "step": int(self.state.global_step),
+                            "epoch": round(float(self.state.epoch or 0.0), 3),
+                            "n_correct": n_ok,
+                            "n_gen": int(rewards.numel()),
+                            "gt": answer,
+                            # 采到的答案分布：看错的时候是错成同一个选项(系统性偏差)
+                            # 还是散着错(纯不会)，两者要的干预完全不同
+                            "preds": [t.strip()[:8] for t in texts],
+                            "pcd": pcd_path,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+
             # advantage 全零（组内 reward 无差异）→ 无学习信号，跳过 forward 省算力
             if std <= 1e-6:
                 continue

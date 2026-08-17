@@ -24,9 +24,10 @@
 8. [建议的启动顺序](#八建议的启动顺序)
 9. [边下边训](#九边下边训stream_from_blob)
 10. [训完怎么测 checkpoint](#十训完怎么测-checkpoint)
-11. [附一：已知限制](#附一已知限制)
-12. [附二：代码改动](#附二本次为适配本机所做的代码改动)
-13. [**附三：显存排查的四个坑**](#附三显存排查的四个坑2026-08-17) ← OOM 了先看这个
+11. [难度打标](#十一难度打标difficulty_log)
+12. [附一：已知限制](#附一已知限制)
+13. [附二：代码改动](#附二本次为适配本机所做的代码改动)
+14. [**附三：显存排查的四个坑**](#附三显存排查的四个坑2026-08-17) ← OOM 了先看这个
 
 ---
 
@@ -661,11 +662,31 @@ stream_release_lag: 2       # 滞后 2 个窗口再删，防止预取/训练错�
   wall/door/window 和 20 类家具 bbox 的 F1@IoU0.25/0.50，输入是 layout txt 文件对。
   和选择题准确率毫无关系。`inference.py`（`generate_layout`）同理。这两个是上游
   SpatialLM 留下的，跟 GRPO 这条线没有交集。
-- **没有 val/test split。** `data/AirCopBench/` 下四个全是 `*_VQA_train.json`，
-  UrbanVideo 只有一个 MCQ json。且训练配置是 `max_samples: null`，**全量参与训练**。
+- **仓库里原本没有 val/test split。** `data/AirCopBench/` 下四个全是 `*_VQA_train.json`，
+  UrbanVideo 只有一个 MCQ json。`data/grpo_test.json` 名字骗人，里面是 AirCop 的**训练**数据。
+  `data/nuScenes/*val*.json`、`data/DVG/test.json` 属于别的任务，跟这条线无关。
 
-所以下面这个脚本抽的是**训练集的子集**：accuracy 涨了只能说明"没训坏 / 在见过的题上更准了"，
-**不能证明泛化**。要证明泛化必须先切一份留出集重训——目前选择是不切。
+**2026-08-17 起可以切了**：`grpo/split_holdout.py` 按点云分组切留出集（seed 42 确定性）。
+
+```bash
+python grpo/split_holdout.py --json data/UrbanVideoBench/MCQ_EmbodiedCity_AerialVLN.json \
+    --test_ratio 0.2 --seed 42
+# -> _train.json 3251 条 / 927 点云   _test.json 829 条 / 232 点云   点云交集 0
+```
+
+**必须按点云分组，不能按条目随机切**：UrbanVideo 4080 题只有 1159 个点云（平均 3.5 题/场景，
+max 11），按条目切会让同一场景同时出现在两边，泄漏。脚本还按来源分层
+（AerialVLN / EmbodiedCity 准确率差 13 个点，比例飘了整体数字就跟着飘），并断言两边点云交集为 0。
+
+⚠ 切完**必须用 train 那份重训**。对已用全量数据训完的 ckpt 跑这个 test，测的还是训练集。
+配套：`config_urbanvideo_holdout.yaml`（训练，指向 `_train.json`）+
+`config_urbanvideo_eval_test.yaml`（评测，指向 `_test.json`）。
+
+⚠ 829 条的检测下限（McNemar，p<0.05 双侧）：不一致率 5% → 需净提升 ≥1.7 点；10% → ≥2.3 点；
+20% → ≥3.2 点。真实提升低于这个幅度会显示"不显著"，**那是样本量不够，不等于没提升**。
+
+若仍用不切分的全量配置（`config_urbanvideo.yaml` / `config_aircop.yaml`），下面脚本抽的就是
+**训练集的子集**：accuracy 涨了只能说明"没训坏"，**不能证明泛化**。
 
 ### `grpo/eval_mcq.py`
 
@@ -757,6 +778,70 @@ n 越小噪声越大，想区分 1~2 个百分点的差距建议 `-n 2000` 以�
 
 
 
+## 十一、难度打标（`difficulty_log`）
+
+训练本来就要给每个 prompt 采 G 条 rollout 并逐条判对错，这份信息原先聚合成 accuracy
+之后就扔了。打开开关后把**每个 group 的逐题结果**落盘，于是跑一遍训练顺带得到一份
+全数据集难度图谱。开销：每 group 一行 json，纯 CPU 无同步，可忽略。
+
+```yaml
+difficulty_log: true      # 默认 false；不写这行就是关的
+```
+
+产物在 **`<output_dir>/difficulty/rank{0..7}.jsonl`**（8 个 rank 各写各的，不加锁——
+并发追加同一文件会撕裂）。每行：
+
+```json
+{"idx": 142, "step": 37, "epoch": 1.16, "n_correct": 3, "n_gen": 8,
+ "gt": "B", "preds": ["B","D","B","A","B","D","D","A"], "pcd": "..."}
+```
+
+落盘的是**原始计数**，不是标签——阈值随时可改，不用重训。记录点在
+`grpo_trainer.py` 的 `if std <= 1e-6: continue` **之前**：被跳过的组正是"全对"和"全错"，
+写在 continue 之后就全丢了。存 `preds` 是为了区分**错成同一个选项**（系统性错误信念）
+和**散着错**（纯不会），两者要的干预完全不同。
+
+⚠ 文件以 `"a"` 追加模式打开。同一个 `output_dir` 跑第二次，两轮记录会混在一起——
+重跑前换 `output_dir` 或先把 `difficulty/` 挪走。
+
+### `grpo/analyze_difficulty.py`
+
+```bash
+python grpo/analyze_difficulty.py --dir <output_dir>/difficulty --max_epoch 1.0 --show 10
+
+# 导出难题子集
+python grpo/analyze_difficulty.py --dir ... --max_epoch 1.0 \
+    --src data/UrbanVideoBench/MCQ_EmbodiedCity_AerialVLN_train.json \
+    --emit_hard data/UrbanVideoBench/hard_train.json
+```
+
+四个桶，判据是 `p = 累计答对数 / 累计 rollout 数`：
+
+| 标签 | 判据 | GRPO 行为 | 含义 |
+|---|---|---|---|
+| 太易·零梯度 | `p = 1` | `std=0` → 跳过 | 全对，训了等于没训 |
+| 偏易 | `0.5 ≤ p < 1` | 有梯度 | 会做但不稳 |
+| 偏难 | `0 < p < 0.5` | 有梯度 | **最有价值** |
+| 太难·零梯度 | `p = 0` | `std=0` → 跳过 | 一条都没采到对的，RL 够不着 |
+
+分界线不是难易而是**有没有梯度**：只有 `0 < p < 1` 组内 reward 才有方差，两头都被
+`compute_loss` 直接跳过。0.5 那条线只是方便看，没有机制上的意义。
+
+⚠ **`--max_epoch 1.0`**：`p` 是跨 epoch 混算的，而策略一直在变。模型真学到东西的话，
+后面 epoch 正确率天然更高，混算会把题目**显得比实际简单**。做筛选只用第一遍的数据。
+代价是每题只有 8 条 rollout，`p` 只能取 9 个离散值。
+
+⚠ **`太难·零梯度` 不能直接当难题用。** 脚本会额外算"是不是稳定错成同一个选项"：是 →
+模型有确定的错误信念、或该题 GT 可疑，RL 靠采样纠正不了（8 条里一条对的都没有，
+advantage 恒为 0），得走 SFT 或人工抽查标注。所以 `--emit_hard` 默认剔除这一桶，
+要留得显式加 `--keep_allwrong`。
+
+⚠ **别直接拿难题子集替换全量训练集。** 把简单题全删了，模型可能在那些题上退化。
+稳妥做法是难题**过采样**：难题复制 2~3 份再和原数据拼起来，让有梯度的组占比上去，
+同时留着简单题做锚。
+
+---
+
 ## 附一：已知限制
 
 调查过程中发现的、与"能否跑出效果"相关的设计限制，供调参时参考：
@@ -821,6 +906,23 @@ n 越小噪声越大，想区分 1~2 个百分点的差距建议 `-n 2000` 以�
 | `grpo_trainer.py` | **`grpo/mem_gb` 改用 `max_memory_allocated()` + 每步 `reset_peak_memory_stats()`**，并新增 `grpo/mem_now_gb`（常驻）。原来只报 `memory_allocated()`（步末常驻），测不到步内瞬时峰值——这是导致本轮多次误判的直接原因 |
 | `config_urbanvideo.yaml` | `gradient_checkpointing: false→true`、`max_points: 65536→16384`、`logp_batch_size: 4→1`、新增 `optim: adamw_bnb_8bit`；`save_steps: 200→25`；header 全部重写 |
 | `config_urbanvideo.yaml` | **`save_steps: 200→25`**：8 卡下 UrbanVideo 只有 128 步/epoch，200 步意味着一个中间 ckpt 都存不下 |
+
+### 第四轮：留出集 / 难度打标 / 评测重采样 bug（2026-08-17）
+
+| 文件 | 改动 |
+|---|---|
+| `split_holdout.py` | **新增**：按点云分组 + 按来源分层切留出集，断言两边点云交集为 0。seed 42 确定性，随时可重现 |
+| `config_urbanvideo_holdout.yaml` | **新增**：`_train.json` + `lr 1e-6→5e-6` + `epochs 1→5`（510 步）+ `save_steps 125 / limit 4`。lr 和 epoch 的依据见 §十 首轮实测：上一轮 `‖ΔW‖/‖W‖` 只有 1e-5，权重根本没动 |
+| `config_urbanvideo_eval_test.yaml` | **新增**：只给 `eval_mcq.py` 用，`train_json` 指向 `_test.json`（字段名沿用是为了复用 `FloodnetGRPODataset`，不代表它是训练数据） |
+| `spatiallm_grpo_utils.py` | **修 bug**：`load_point_cloud_tensor` 加 `sample_seed`。原来 `max_points` 封顶时用全局 torch RNG 抽点，而 `eval_mcq.py` 从不调 `torch.manual_seed`——**base 在卡 0、ckpt 在卡 1-3 并行评测时，同一个文件各自抽到不同的 16384 个点**，两边其实在回答不同的点云，对比里混进了纯重采样噪声。UrbanVideo 实测 62% 的点云会触发封顶。给定 seed 后抽样只由 `(seed, path)` 决定。**必须用 `zlib.crc32` 而不是内置 `hash()`**：后者对 str 按进程随机加盐（`PYTHONHASHSEED`），跨进程对不上，改了等于没改 |
+| `eval_mcq.py` | `run_one` 接 `sample_seed` 并传给 `get_pcd`，调用处传 `args.seed`；`--seed` 的 help 补上"同时决定抽哪些点"。⚠ seed 一改绝对数字就和旧结果不可比，base 必须和 ckpt 一起重跑 |
+| `dataset.py` / `grpo_trainer.py` | 样本返回值加 `idx`，collate 透传（`b.get("idx", -1)` 兼容旧格式） |
+| `grpo_trainer.py` | 新增 `difficulty_log`，见 §十一。记录点写在 `std<=1e-6` 的 `continue` **之前** |
+| `analyze_difficulty.py` | **新增**：聚合难度标记 → 四桶分布 + 系统性错误检测 + `--emit_hard` 导出 |
+| `train_grpo.py` | 透传 `difficulty_log` |
+
+⚠ 训练侧仍走 `sample_seed=None`（全局 RNG）：多个 epoch 里同一场景换着子集看，算一点弱增强。
+只有评测必须确定性。要让训练也确定性，`grpo_trainer.py:187` 加个参数即可。
 
 ---
 

@@ -176,6 +176,7 @@ def main():
         pcd_cache_size=cfg.get("pcd_cache_size", 32),
         max_points=cfg.get("max_points", 0),
         stream_sampler=stream_sampler,
+        difficulty_log=cfg.get("difficulty_log", False),
     )
 
     trainer.train()
