@@ -39,6 +39,7 @@ UrbanVideo 一个 MCQ json），且训练配置是 max_samples: null，即全量
 import os
 import sys
 import time
+import json
 import random
 import argparse
 import collections
@@ -218,6 +219,12 @@ def main():
     ap.add_argument("-n", "--num_prompts", type=int, default=512, help="抽多少条；-1=全量")
     ap.add_argument("--seed", type=int, default=0, help="决定抽哪些条。多个 ckpt 用同一子集")
     ap.add_argument("--show", type=int, default=0, help="打印前几条原始输出")
+    ap.add_argument(
+        "--dump",
+        default=None,
+        help="把逐条结果写到这个 jsonl。多 ckpt 时才能做配对显著性检验——"
+        "总分差几个百分点常常只是噪声，必须看同一道题上谁对谁错（见 compare_ckpts.py）",
+    )
     args = ap.parse_args()
 
     cfg = yaml.safe_load(open(args.config))
@@ -247,6 +254,25 @@ def main():
         print(f"\n>>> 评测 {c} ...", flush=True)
         rows = run_one(c, cfg, subset, tok)
         summaries.append((c, report(c, rows, show=args.show)))
+        if args.dump:
+            # 逐条落盘：idx 是数据集里的全局下标，配对检验靠它对齐
+            with open(args.dump, "a") as f:
+                for i, r in zip(idxs, rows):
+                    f.write(
+                        json.dumps(
+                            {
+                                "ckpt": c,
+                                "idx": i,
+                                "split": r["split"],
+                                "gt": r["gt"],
+                                "pred": r["pred"],
+                                "reward": r["reward"],
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+            print(f"  [dump] 逐条结果已追加到 {args.dump}")
 
     if len(summaries) > 1:
         print("\n" + "=" * 72)

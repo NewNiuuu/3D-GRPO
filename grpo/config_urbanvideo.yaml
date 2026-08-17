@@ -70,7 +70,11 @@ stream_release_lag: 2      # 滞后几个窗口再删
 output_dir: /home/aiscuser/nyp/saves/grpo_urbanvideo
 logging_steps: 1
 save_steps: 100
-save_total_limit: 3
+# 单卡 4080/4 = 1020 步/epoch，save_steps=100 会产生 10 个中间点。
+# 原来设 3 会只留最后 3 个 —— 但 AirCop 实测 accuracy 峰值在前 1/5（对应这里约
+# 第 200 步），之后一路回落。留 3 个等于恰好把最该要的早期 ckpt 删光。
+# 全留：10 × 11GB = 110GB，磁盘 4.8T 余量足够。
+save_total_limit: 12
 report_to: wandb
 wandb_project: spatiallm-grpo
 run_name: urbanvideo-g8-lr1e6
