@@ -1,0 +1,108 @@
+# SpatialLM GRPO —— UrbanVideoBench **留出集重训**版（2026-08-17）
+#
+# 启动（⚠ 必须用 spatiallm-grpo 环境里的 torchrun，写绝对路径最稳）：
+#   cd /home/aiscuser/nyp/3D-RL
+#   nohup /home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/torchrun --nproc_per_node 8 \
+#       grpo/train_grpo.py --config grpo/config_urbanvideo_holdout.yaml \
+#       > /tmp/train_uv_holdout.log 2>&1 &
+#
+#   直接敲 `torchrun` 会走 PATH 上容器默认的 /opt/conda/envs/ptca/bin/torchrun，
+#   那个环境没装 transformers，8 个 rank 全部 ModuleNotFoundError 秒退。
+#
+# 与 config_urbanvideo.yaml 的三处差异，每一处都是上一轮实测结果逼出来的：
+#
+# 1) train_json 换成 _train.json（3251 条 / 927 个点云，80%）
+#    原来 max_samples: null 把 4080 条全训了，所以没有任何数据能证明泛化。
+#    留出的 829 条 / 232 个点云**不参与训练**，评测只在它上面跑
+#    （配置见 config_urbanvideo_eval_test.yaml）。
+#    切分按点云分组（grpo/split_holdout.py，seed 42 确定性，随时可重现）：
+#    一个点云平均对应 3.5 道题，按条目随机切会让同一场景同时出现在两边，泄漏。
+#
+# 2) learning_rate 1.0e-6 -> 5.0e-6
+#    上一轮 128 步跑完，checkpoint 之间的 ||ΔW||/||W|| 只有 1e-5 量级，
+#    比 fp32->bf16 的量化噪声（1.6e-3）还小两个数量级——即权重根本没动。
+#    评测印证：base 0.8800 / c25 0.8800 / c75 0.8790 / c128 0.8800，
+#    1000 条里 996~999 条预测完全一致，McNemar 全部 p=1.0000。
+#
+# 3) num_train_epochs 1 -> 5
+#    3251 / 32 = 102 步一个 epoch。上一轮实测 13.55 秒/步，
+#    5 epoch = 510 步 ≈ 115 分钟，正好卡在预定的两小时预算内。
+#    （1 个 epoch 太短：AirCop 那轮跑了 424 步才看出趋势）
+#
+# ⚠ 显存不变：上一轮跑满一个 epoch 的真实峰值 35.7GB / 39.5GB，余量 3.8GB。
+#   下面四项一个都不能动（gradient_checkpointing / max_points 16384 /
+#   logp_batch_size 1 / adamw_bnb_8bit），去掉任何一项都会重新 OOM。
+#   lr 和 epoch 数不影响显存。
+#
+# ⚠ 前 20 步盯 train/grpo/kl：上一轮全程最大才 0.01414，lr 提了 5 倍之后
+#   若冲到 0.1 以上说明策略跑偏，停掉把 lr 降到 3e-6 重来。
+
+### 模型
+model_path: /home/aiscuser/nyp/ckpts/point_mixed_downsample
+dtype: bfloat16
+
+### 数据（A-G 选择题；reward：答对=1，答错或格式崩=0）
+train_json: data/UrbanVideoBench/MCQ_EmbodiedCity_AerialVLN_train.json
+max_samples: null
+num_bins: 1280
+max_points: 16384
+
+### GRPO 采样
+num_generations: 8
+max_new_tokens: 8
+temperature: 1.0
+top_p: 1.0
+top_k: 0
+
+### GRPO 目标
+kl_coef: 0.04
+clip_eps: 0.2
+num_iterations: 1
+
+### 训练（8 卡：有效 batch = 8 x 1 x 4 = 32 个 prompt = 256 条 rollout）
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+logp_batch_size: 1
+pcd_cache_size: 64
+learning_rate: 5.0e-6
+num_train_epochs: 5
+warmup_ratio: 0.03
+lr_scheduler_type: constant
+gradient_checkpointing: true
+dataloader_num_workers: 4
+seed: 42
+optim: adamw_bnb_8bit
+
+### 边下边训（数据已全量落盘）
+stream_from_blob: false
+pcd_local_root: /home/aiscuser/nyp/pcdata
+stream_window_files: 24
+stream_prefetch: true
+stream_delete_after: true
+stream_release_lag: 2
+
+### 输出/日志
+output_dir: /home/aiscuser/nyp/saves/grpo_urbanvideo_holdout
+logging_steps: 1
+# 510 步，只存 4 份（单个 8.9GB，合计 36GB）。
+# ⚠ save_steps 和 save_total_limit 必须一起定，不能只把 limit 调小：
+#   limit 保留的是**最后 N 个**，删的永远是最早的。若 save_steps=50 产出 10 个
+#   而 limit=4，留下的是 350/400/450/500——全挤在训练末尾，早期全被删光。
+#   而 AirCop 实测 accuracy 峰值出现在前 1/5，早期 ckpt 恰恰是要看的。
+# 所以改成 125：正好产出 125/250/375/500 四个，均匀覆盖整个训练，一个都不会被删。
+# 另外 step 125 ≈ 1.2 个 epoch，和上一轮结束时的 128 步几乎重合，可直接对照。
+# 训练结束时 trainer.save_model() 还会往 output_dir 根目录写一份最终权重（仅权重，
+# 不含优化器状态，约 3.7GB），不占 save_total_limit 的名额。
+save_steps: 125
+save_total_limit: 4
+report_to: wandb
+wandb_project: spatiallm-grpo-urbanvideo
+run_name: urbanvideo-holdout-g8-lr5e6-e5
+
+### 难度打标
+# 训练本来就要给每个 prompt 采 8 条 rollout 并逐条判对错，这信息原先聚合成
+# accuracy 之后就丢了。打开后把每个 group 的逐题结果追加到
+#   <output_dir>/difficulty/rank{0..7}.jsonl
+# 于是跑一遍训练顺带得到一份全数据集难度图谱，用 grpo/analyze_difficulty.py 聚合。
+# 开销：每 group 一行 json，纯 CPU 无同步，可忽略。
+difficulty_log: true

@@ -4,6 +4,8 @@ SpatialLM GRPO 公共工具：模型加载 + 点云预处理。
 
 抽出来给 grpo_trainer / 数据集共用。所有点云处理逻辑与 inference.py 保持一致。
 """
+import zlib
+
 import numpy as np
 import torch
 
@@ -67,7 +69,7 @@ def preprocess_point_cloud(points, colors, grid_size, num_bins):
     return torch.as_tensor(feat)
 
 
-def load_point_cloud_tensor(pcd_path, num_bins, cleanup=True, max_points=0):
+def load_point_cloud_tensor(pcd_path, num_bins, cleanup=True, max_points=0, sample_seed=None):
     """
     从路径（本地或 blob 逻辑路径）读点云 -> (N, 9) 张量。
 
@@ -81,6 +83,18 @@ def load_point_cloud_tensor(pcd_path, num_bins, cleanup=True, max_points=0):
     Sonata 是 fp32 且注意力随点数增长，22 万点那种会把 40G A100 打爆。
     抽样在 CPU 上做，且发生在缓存之前，所以每个文件只抽一次（同一 epoch 内
     同一份点云对所有 rollout 保持一致，不会给 GRPO 的组内比较引入噪声）。
+
+    sample_seed:
+      None（默认，训练用）= 用全局 torch RNG，各进程/各次加载抽到的点不同。
+        训练时这没问题，甚至算一点数据增强：多个 epoch 里同一场景换着子集看。
+      给定整数（评测用）= 抽样只由 (sample_seed, pcd_path) 决定，
+        **任何进程、任何 ckpt、任何时候加载同一个文件都得到同一批点**。
+        这条对评测是必须的：UrbanVideo 实测 62% 的点云会触发封顶，
+        若用全局 RNG，base 在卡 0、ckpt 在卡 1-3 并行评测时，同一个文件
+        各自抽到不同的 16384 个点——两边其实在回答**不同的点云**，
+        base vs ckpt 的差异里就混进了纯重采样噪声，分不清是不是模型变了。
+      注意必须用 crc32 而不是内置 hash()：后者对 str 是按进程随机加盐的
+      （PYTHONHASHSEED），跨进程根本对不上，等于没修。
     """
     pcd = load_o3d_pcd(pcd_path)
     grid_size = Layout.get_grid_size(num_bins)
@@ -89,6 +103,12 @@ def load_point_cloud_tensor(pcd_path, num_bins, cleanup=True, max_points=0):
     points, colors = get_points_and_colors(pcd)
     feat = preprocess_point_cloud(points, colors, grid_size, num_bins)
     if max_points and feat.shape[0] > max_points:
-        idx = torch.randperm(feat.shape[0])[:max_points]
+        gen = None
+        if sample_seed is not None:
+            gen = torch.Generator()
+            gen.manual_seed(
+                (int(sample_seed) * 1000003 + zlib.crc32(str(pcd_path).encode())) % (2**63)
+            )
+        idx = torch.randperm(feat.shape[0], generator=gen)[:max_points]
         feat = feat[idx.sort().values]  # 保序，别打乱 z-order 序列化的局部性
     return feat

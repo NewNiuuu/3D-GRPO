@@ -84,7 +84,7 @@ def pct(n, d):
 
 
 @torch.no_grad()
-def run_one(ckpt, cfg, subset, tok, device="cuda"):
+def run_one(ckpt, cfg, subset, tok, device="cuda", sample_seed=0):
     """在给定子集上评一个 ckpt，返回逐条结果 list[dict]。"""
     model = load_spatiallm(ckpt, dtype=getattr(torch, cfg.get("dtype", "bfloat16")))
     model.set_point_backbone_dtype(torch.float32)
@@ -104,7 +104,13 @@ def run_one(ckpt, cfg, subset, tok, device="cuda"):
         if path in cache:
             cache.move_to_end(path)
             return cache[path]
-        t = load_point_cloud_tensor(path, num_bins, max_points=max_points)
+        # sample_seed 必传：max_points 触发封顶时（UrbanVideo 实测 62% 的点云会触发），
+        # 抽哪 16384 个点必须只由 (seed, path) 决定。否则各 ckpt 在各自的进程里
+        # 用全局 torch RNG 各抽各的，base 和 ckpt 面对的是**不同的点云**，
+        # 对比结果里就混进了重采样噪声，说不清预测差异是不是模型带来的。
+        t = load_point_cloud_tensor(
+            path, num_bins, max_points=max_points, sample_seed=sample_seed
+        )
         cache[path] = t
         while len(cache) > cache_cap:
             cache.popitem(last=False)
@@ -217,7 +223,13 @@ def main():
         help="要评的 ckpt，可重复传多个做对比；不传则用 config 里的 model_path",
     )
     ap.add_argument("-n", "--num_prompts", type=int, default=512, help="抽多少条；-1=全量")
-    ap.add_argument("--seed", type=int, default=0, help="决定抽哪些条。多个 ckpt 用同一子集")
+    ap.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="同时决定两件事：①抽哪些条 ②max_points 封顶时每个点云抽哪些点。"
+        "两者都必须在各 ckpt 之间保持一致，对比才有意义。",
+    )
     ap.add_argument("--show", type=int, default=0, help="打印前几条原始输出")
     ap.add_argument(
         "--dump",
@@ -252,7 +264,7 @@ def main():
     summaries = []
     for c in ckpts:
         print(f"\n>>> 评测 {c} ...", flush=True)
-        rows = run_one(c, cfg, subset, tok)
+        rows = run_one(c, cfg, subset, tok, sample_seed=args.seed)
         summaries.append((c, report(c, rows, show=args.show)))
         if args.dump:
             # 逐条落盘：idx 是数据集里的全局下标，配对检验靠它对齐

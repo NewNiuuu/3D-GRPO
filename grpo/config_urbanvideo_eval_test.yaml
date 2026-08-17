@@ -1,0 +1,31 @@
+# 只给 eval_mcq.py / compare_ckpts.py 用的评测配置——**不要拿它训练**。
+#
+# eval_mcq.py:237 读的是 cfg["train_json"]，所以这里把它指向留出的 test json。
+# 字段名仍叫 train_json 只是为了复用 FloodnetGRPODataset 的加载路径，
+# 不代表它是训练数据。
+#
+# 这 829 条 / 232 个点云不在 config_urbanvideo_holdout.yaml 的训练集里
+# （切分见 grpo/split_holdout.py，按点云分组，已断言两边点云集合交集为 0）。
+# 因此这份数据上的 base vs ckpt 对比，是目前**唯一能证明泛化**的证据。
+#
+# ⚠ 拿它去评 /home/aiscuser/nyp/saves/grpo_urbanvideo/ 下的旧 ckpt 是无效的：
+#   那一轮 max_samples: null，4080 条全训了，这 829 条它见过。
+#   只有 grpo_urbanvideo_holdout/ 下的 ckpt 才能用这份评。
+#
+# ⚠ 829 条的统计检测下限（McNemar，p<0.05 双侧）：
+#     不一致率  5% -> 需净提升 ≥ 1.7 个百分点
+#     不一致率 10% -> 需净提升 ≥ 2.3 个百分点
+#     不一致率 20% -> 需净提升 ≥ 3.2 个百分点
+#   低于这个幅度的真实提升测不出来，结果会是"不显著"而不是"没提升"，别混。
+#
+# 预处理参数必须和训练时一致，否则模型看到的输入分布不一样：
+#   max_points / num_bins 照抄 config_urbanvideo_holdout.yaml。
+
+model_path: /home/aiscuser/nyp/ckpts/point_mixed_downsample
+dtype: bfloat16
+
+train_json: data/UrbanVideoBench/MCQ_EmbodiedCity_AerialVLN_test.json
+num_bins: 1280
+max_points: 16384
+max_new_tokens: 8
+pcd_cache_size: 64
