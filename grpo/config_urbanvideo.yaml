@@ -1,16 +1,41 @@
 # SpatialLM GRPO —— UrbanVideoBench（4080 条 / 1159 个点云 / 119 GB）
 # 环境: /home/aiscuser/miniconda3/envs/spatiallm-grpo
 #
-# ⚠ 显存现状（实测）：本配置**单卡可跑，8 卡会 OOM**。
-#   启动（单卡，已验证）:
-#     cd /home/aiscuser/nyp/3D-RL && CUDA_VISIBLE_DEVICES=0 \
-#       PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-#       python grpo/train_grpo.py --config grpo/config_urbanvideo.yaml
-#   原因：静态占用爬坡到约 21.7GB（权重+ref+梯度+优化器状态）后，UrbanVideo 的
-#   点云编码器激活尖峰还要十几 GB，8 卡再叠 DDP 的梯度桶/通信缓冲就顶穿 40GB。
-#   已试过无效的办法：降 max_points(65536→16384)、降 G(8→6→4)、8bit 优化器、
-#   梯度检查点 —— 峰值都稳在 38GB 附近。要上多卡得先真正砍掉编码器激活
-#   （例如冻结点云塔或让它走 bf16），那是另一件事，没做。
+# ✅ 显存现状（2026-08-17 复测）：**8 卡可跑**，已连续 15 步无 OOM，
+#    峰值 34.4GB / 39.5GB，余量约 5GB。启动命令见 README 第八节。
+#
+#    实测 8 卡峰值序列（本配置）：
+#      20.7 24.9 28.5 19.7 24.6 24.3 34.4 25.2 24.8 19.9 28.4 23.2 24.9 25.2 23.4
+#
+#    ⚠ 这套配置是四项叠加的结果，**单独去掉任何一项都会重新 OOM**：
+#      1) gradient_checkpointing: true —— 砍语言塔反向激活，最大的一刀
+#      2) max_points 65536 -> 16384   —— 砍点云塔瞬时峰值（第 9 步的救命项）
+#      3) logp_batch_size 4 -> 1      —— 砍单次带梯度前向的瞬时峰值
+#      4) ref 前向移到 policy 之前     —— 见 grpo_trainer.py compute_loss (4a)，
+#         消除 ref 激活与 policy 反向图的峰值重叠。数学等价，纯赚。
+#      另有 adamw_bnb_8bit（约 2GB）和 gradient_as_bucket_view（DDP 省一份梯度拷贝）。
+#
+#    ⚠ 本文件 2026-08-17 之前记的显存结论**几乎全是错的**，已全部推翻，教训：
+#      · "8bit 优化器无效" —— 错。当时爆在生成阶段，优化器状态还没惰性分配，
+#        砍它当然没用；等其他手段把崩溃推后，它就省了约 2GB。
+#      · "梯度检查点无效" —— 错。它是最有效的一项（峰值 35 -> 22）。
+#      · "降 max_points 无效" —— 错。当时用 memory_allocated()（步末常驻）去测，
+#        而点云塔的开销是**瞬时**的，常驻值根本反映不出来。改用
+#        max_memory_allocated() 后一测就分明：同一批数据第 9 步，
+#        65536 直接 OOM，16384 是 35.6GB。
+#      · "单卡可跑" —— 错。只测了三五步，实际第 7~9 步就 OOM。
+#      教训：显存结论必须①看 OOM 栈而不是推理②量真峰值不是常驻③至少跑 15 步。
+#
+#    真正的瓶颈是 policy 的带梯度 log-prob 前向（OOM 栈固定在
+#    compute_loss -> _logprobs_chunked -> _seq_logprobs）。显存逐步跳动是
+#    GRPO 零方差跳过导致的：组内 8 条 rollout 全对**或全错**都会 std=0 被跳过，
+#    那一步不建反向图；有对有错才吃梯度。所以必须按"所有组都产生梯度"的
+#    最坏情况留余量，不能指望跳过。
+#
+#    ⚠ max_points 16384 的代价：本数据集 p50 是 26.2k 点、p90 59.1k，
+#      也就是说一半以上的样本被下采样了，输入保真度低于 SFT 时。
+#      这是为了跑通做的取舍，会不会影响效果需要实测对比。
+#      若想拿回精度，可试 32768（未测），或走 DeepSpeed ZeRO-2 腾出静态基线。
 #
 # 与 AirCop 的两个关键差异：
 #   1) 答案字母到 G（A-G 全都出现），reward.py 的 CHOICES 已放宽到 A-H
@@ -28,7 +53,7 @@ num_bins: 1280
 #   p25 13.0k / p50 26.2k / p75 40.5k / p90 59.1k / max 104k（另一次抽样见过 22 万）
 # 点数直接决定 Sonata(fp32) 的注意力显存：5.5万点时前向+反向 14.3GB，
 # 22 万点会把 40G 卡打爆。65536 只影响约 6% 的文件，对它们做均匀随机下采样。
-max_points: 65536
+max_points: 16384
 
 ### GRPO 采样
 num_generations: 8         # 选项多到 G，随机基线只有 ~1/6，组内更容易有方差
@@ -45,16 +70,17 @@ num_iterations: 1
 ### 训练（8 卡：有效 batch = 8 x 2 x 2 = 32 个 prompt = 256 条 rollout）
 per_device_train_batch_size: 1
 gradient_accumulation_steps: 4
-logp_batch_size: 4         # 一次前向算几条序列的 logprob；0=整组一次算完。实测 G=8 一次算完峰值 37GB/40GB 太贴边
+logp_batch_size: 1
 pcd_cache_size: 64         # 缓存的是预处理后的张量：max_points 封顶后单条仅 ~2.4MB
                            #（125MB 是原始 ply 的大小，不是缓存占用），可以放宽
 learning_rate: 1.0e-6
 num_train_epochs: 1
 warmup_ratio: 0.03
 lr_scheduler_type: constant
-gradient_checkpointing: false
+gradient_checkpointing: true
 dataloader_num_workers: 4
 seed: 42
+optim: adamw_bnb_8bit
 
 ### 边下边训（数据已全量落盘，默认关闭；磁盘吃紧时改 true 即可）
 # 参数按实测文件大小配：本数据集 1159 个 ply，均值 104.7MB / p50 124.8MB / 合计 118.5GB。
@@ -69,11 +95,14 @@ stream_release_lag: 2      # 滞后几个窗口再删
 ### 输出/日志
 output_dir: /home/aiscuser/nyp/saves/grpo_urbanvideo
 logging_steps: 1
-save_steps: 200
-# 单卡 4080/4 = 1020 步/epoch -> 在 200/400/600/800/1000 各存一个，训练结束再存
-# 一个（1020），合计 6 个，limit=6 正好全留、一个不删。约 6 × 11GB = 66GB。
+save_steps: 25
+# ⚠ 这里跟 AirCop 差一个数量级，别照抄。8 卡有效 batch = 8 x 1 x 4 = 32 个 prompt，
+# 4080 / 32 = 128 步就跑完一个 epoch（不是单卡那 1020 步）。
+# 之前写的 save_steps: 200 在 128 步的 epoch 里**一个中间 checkpoint 都存不下**，
+# 只会在训练结束时存一个，等于白跑一晚上没法做早停对比。
+# 25 -> 在 25/50/75/100/125 各存一个，训练结束再存一个（128），合计 6 个。
 # limit 保留的是**最后 N 个**，删的永远是最早的；而 AirCop 实测 accuracy 峰值在
-# 前 1/5（对应这里约第 200 步），所以不能设得比实际产出的 ckpt 数更小。
+# 前 1/5（对应这里约第 25 步），所以不能设得比实际产出的 ckpt 数更小。
 save_total_limit: 6
 report_to: wandb
 wandb_project: spatiallm-grpo

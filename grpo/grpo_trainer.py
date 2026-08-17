@@ -454,14 +454,43 @@ class SpatialLMGRPOTrainer(Trainer):
                 # 累计：到目前为止有多少个 micro-batch 实际吃到非零梯度（单调递增）
                 "grpo/updated_microbatches": float(self._updated_microbatches),
                 "grpo/skipped_groups": float(acc["n_groups_seen"] - acc["n_groups_upd"]),
-                # 本卡当前已分配显存（GB）。这条曲线必须是平的；持续上涨=显存泄漏，
-                # 长跑一定会在中途 OOM，别等跑到一半才发现。
-                "grpo/mem_gb": torch.cuda.memory_allocated() / 1024**3
+                # 本卡显存（GB）。mem_gb 是**上一次日志以来的步内峰值**，不是步末
+                # 当前值——OOM 由瞬时峰值决定，而步末采样看不见它。实测教训：
+                # 8 卡上 memory_allocated() 稳在 19.65GB 的"平坦"曲线底下，藏着
+                # 能冲到 39.5GB 的尖峰，照着平坦曲线判断"还很宽松"会直接踩空。
+                # 这条曲线必须又平又低；持续上涨=泄漏，忽高忽低=有长尾样本。
+                # mem_now 保留当前值，两条一起看才能区分"常驻涨"和"瞬时尖峰"。
+                "grpo/mem_gb": torch.cuda.max_memory_allocated() / 1024**3
+                if torch.cuda.is_available()
+                else 0.0,
+                "grpo/mem_now_gb": torch.cuda.memory_allocated() / 1024**3
                 if torch.cuda.is_available()
                 else 0.0,
             }
         )
+        if torch.cuda.is_available():
+            # 清零高水位，让下一条 mem_gb 反映的是下一个区间的峰值而不是历史最大
+            torch.cuda.reset_peak_memory_stats()
         self._reset_log_accum()
+
+    def _wrap_model(self, *args, **kwargs):
+        """在 HF 建好 DDP 配置之后，补一个它没暴露的省显存开关。
+
+        默认 DDP 同时持有「梯度本体」和「allreduce 通信桶」两份完整拷贝，
+        1.83B 参数 bf16 每份 3.7GB —— 多卡因此比单卡凭空多吃约 7.4GB。
+        实测 UrbanVideo：单卡峰值 28.3GB，4 卡 36.0GB，差值 7.7GB 正好对上。
+        gradient_as_bucket_view 让 param.grad 指向桶内偏移，省掉其中一份。
+
+        为什么必须在这里改而不是 __init__：`accelerator.ddp_handler` 是
+        Trainer._wrap_model() 里现场 new 出来的（transformers/trainer.py 约 2097 行），
+        __init__ 时还不存在，而且就算提前塞了也会被这里整个覆盖掉。
+        真正读取它的是随后的 accelerator.prepare()，所以此刻改还来得及。
+        """
+        model = super()._wrap_model(*args, **kwargs)
+        handler = getattr(self.accelerator, "ddp_handler", None)
+        if handler is not None:
+            handler.gradient_as_bucket_view = True
+        return model
 
     def _reset_log_accum(self):
         self._log_accum = {
@@ -524,6 +553,17 @@ class SpatialLMGRPOTrainer(Trainer):
             if n_valid < 1:
                 continue
 
+            # ---- (4a) 先算冻结 ref 的 logprob ----
+            # 必须在 policy 带梯度前向**之前**算。ref 是 no_grad 的，算完只留下
+            # (G, gen_len) 这么点结果，中间激活立刻释放；而如果放在 policy 之后，
+            # ref 的瞬时激活会叠在 policy 那张还没 backward 的反向图上面，
+            # 两个峰值重叠。数学上完全等价——ref 冻结，ref_logp 不参与求导。
+            ref_logp = None
+            if self.ref_model is not None:
+                ref_logp = self._ref_logprobs(
+                    full_ids, prompt_len, pcd_batched, device
+                )
+
             # (4)+(5) 一次性重算 G 条的 logprob + KL（批处理，不再逐条循环）
             tok_logp = self._logprobs_chunked(
                 base, full_ids, prompt_len, pcd_batched, self.logp_batch_size
@@ -542,10 +582,8 @@ class SpatialLMGRPOTrainer(Trainer):
             policy_tok = -torch.min(unclipped, clipped)          # (G, gen_len)
 
             # ---- KL 项（k3 无偏估计，逐 token ≥0）----
-            if self.ref_model is not None:
-                ref_logp = self._ref_logprobs(
-                    full_ids, prompt_len, pcd_batched, device
-                )
+            # ref_logp 已在 policy 前向之前算好（见上面 4a），这里只做纯张量运算
+            if ref_logp is not None:
                 diff = ref_logp - tok_logp  # logπ_ref - logπ_θ
                 kl_tok = torch.exp(diff) - diff - 1.0
             else:

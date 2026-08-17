@@ -1,8 +1,14 @@
 # SpatialLM GRPO —— 运行可行性调查报告
 
-> 调查日期：2026-08-15，环境就绪与实跑验证：2026-08-16
+> 调查日期：2026-08-15，环境就绪与实跑验证：2026-08-16，显存问题定位与修复：2026-08-17
 > 运行环境：本机 `/home/aiscuser/nyp/3D-RL`，8× A100-SXM4-40GB
-> 结论：**已在本机跑通**。AirCop 8 卡（≈4.0 s/it）与 UrbanVideo 单卡均已实训，产出 ckpt 可独立加载。详见[第七节](#七本机就绪状态2026-08-16-实测)。
+> 结论：**已在本机跑通**。AirCop 与 UrbanVideo **均可 8 卡训练**，产出 ckpt 可独立加载。详见[第七节](#七本机就绪状态2026-08-16-实测)。
+>
+> ⚠ 2026-08-17 更新：此前"UrbanVideo 只能单卡 / 8 卡必 OOM"的结论**是错的**，
+> 而且"单卡可跑"同样是错的（实测第 7~9 步 OOM）。错误的根因、当时是怎么误判的、
+> 以及最终的解法，全部写在[附三：显存排查的四个坑](#附三显存排查的四个坑2026-08-17)。
+> 如果你之后再遇到 OOM，**先读附三**，能省掉我这次走的所有弯路。
+
 
 ---
 
@@ -16,6 +22,11 @@
 6. [监控方式](#六监控方式)
 7. [本机就绪状态](#七本机就绪状态2026-08-16-实测)
 8. [建议的启动顺序](#八建议的启动顺序)
+9. [边下边训](#九边下边训stream_from_blob)
+10. [训完怎么测 checkpoint](#十训完怎么测-checkpoint)
+11. [附一：已知限制](#附一已知限制)
+12. [附二：代码改动](#附二本次为适配本机所做的代码改动)
+13. [**附三：显存排查的四个坑**](#附三显存排查的四个坑2026-08-17) ← OOM 了先看这个
 
 ---
 
@@ -168,7 +179,7 @@ learning_rate: 1.0e-6            # 关键
 num_train_epochs: 1
 warmup_ratio: 0.03
 lr_scheduler_type: constant
-gradient_checkpointing: false    # 本机 40G A100 显存够，关掉换速度
+gradient_checkpointing: false    # AirCop 显存够，关掉换速度；UrbanVideo 必须 true
 dataloader_num_workers: 4
 logp_batch_size: 4               # 一次前向算几条序列的 log-prob，0=整组一次算完
 pcd_cache_size: 64               # 点云张量 LRU 缓存条数
@@ -177,7 +188,8 @@ seed: 42
 
 **有效 batch 怎么算**：`卡数 × per_device_train_batch_size × gradient_accumulation_steps`。
 8 卡时 = `8 × 1 × 4` = **32 个 prompt/step**，每个 prompt 采 G=8 遍
-= **256 条 rollout/step**。AirCop 13578 条 ÷ 32 ≈ **424 step/epoch**。
+= **256 条 rollout/step**。AirCop 13578 条 ÷ 32 ≈ **424 step/epoch**；
+UrbanVideo 4080 条 ÷ 32 ≈ **128 step/epoch**（差一个数量级，`save_steps` 别照抄）。
 
 **`learning_rate` 是最该小心的一个。** RL 阶段必须比 SFT 小**一到两个量级**
 （SFT 用 2e-5，这里用 1e-6）。原因：SFT 有标准答案兜底，学偏了也偏不到哪去；
@@ -187,6 +199,12 @@ lr 一大策略立刻崩，而且**崩了不可逆**——采样分布坏了以�
 
 `logp_batch_size` 和 `pcd_cache_size` 是纯工程参数，不影响训练结果，只影响显存/速度。
 `warmup_ratio: 0.03` + `constant` 表示前 3% 步线性升到 1e-6 然后一直保持。
+
+**⚠ 显存相关的四个参数，UrbanVideo 上必须一起改，缺一个就 OOM**（见附三）：
+`gradient_checkpointing: true`、`max_points: 16384`、`logp_batch_size: 1`、
+`optim: adamw_bnb_8bit`。`gradient_checkpointing` 会影响速度但不影响结果；
+`max_points` **会影响结果**（降低输入保真度），是为跑通做的取舍。
+
 
 ### ⑥ 输出与日志
 
@@ -199,6 +217,14 @@ report_to: wandb
 wandb_project: spatiallm-grpo
 run_name: aircop-g8-lr1e6
 ```
+
+**⚠ `save_steps` 必须按"这个数据集在这个卡数下有多少步/epoch"来定，不能跨数据集照抄。**
+8 卡时 AirCop 是 424 步/epoch（`save_steps: 200` → 存 200/400/424 三个），
+UrbanVideo 只有 **128 步/epoch**（`save_steps: 200` → **一个中间 ckpt 都存不下**，
+只有训练结束那一个，等于白跑，没法做早停对比）。UrbanVideo 已改成 `save_steps: 25`。
+`save_total_limit` 保留的是**最后 N 个**，删的永远是最早的——而 AirCop 实测 accuracy
+峰值出现在前 1/5，所以它不能设得比实际产出的 ckpt 数更小，否则最好的那个会被删掉。
+
 
 
 ---
@@ -259,7 +285,8 @@ saves/grpo_aircop/
 ```
 {'grpo/mean_reward': 0.5,  'grpo/accuracy': 0.5,   'grpo/reward_std': 0.577,
  'grpo/kl': 0.0,           'grpo/completion_len': 3.0,
- 'grpo/frac_nonzero_adv': 1.0, 'grpo/skipped_groups': 1.0, 'grpo/mem_gb': 21.68}
+ 'grpo/frac_nonzero_adv': 1.0, 'grpo/skipped_groups': 1.0,
+ 'grpo/mem_gb': 24.94,     'grpo/mem_now_gb': 19.65}
 ```
 
 ### 各字段该期待什么值
@@ -270,9 +297,10 @@ saves/grpo_aircop/
 | `grpo/frac_nonzero_adv` | 0.3~0.7 | 有多少组产生了学习信号。若 <0.1 说明题目太简单或太难，GRPO 学不动 |
 | `grpo/kl` | 从 0 缓慢上升 | 若飙升（>0.5）说明策略跑偏，该调小 lr 或调大 kl_coef |
 | `grpo/completion_len` | 1~2 | 选择题答案就 1 个字母。若接近 `max_new_tokens` 说明模型在胡扯没吐 EOS |
-| `grpo/reward_std` | 0/1 reward 下的离散取值 | 全对/全错时为 0，该组会被跳过 |
+| `grpo/reward_std` | 0/1 reward 下的离散取值 | 全对**或全错**时为 0，该组会被跳过（两头都跳，不只是全对） |
 | `grpo/skipped_groups` | 本步被跳过的组数 | 与 `frac_nonzero_adv` 互为补充 |
-| `grpo/mem_gb` | 稳定在一个平台值 | 前几步会从 10 GB 爬到 21.7 GB（梯度和优化器状态逐步分配），**之后应该持平**。持续上涨才是异常 |
+| `grpo/mem_gb` | **步内真峰值**，忽高忽低属正常，但顶不能逼近卡容量 | 用 `max_memory_allocated()` 且每步 `reset_peak_memory_stats()`。OOM 由**瞬时峰值**决定，波动来自零方差跳过（跳过的步不建反向图，显存就低）。**留余量要按"所有组都产生梯度"的最坏情况算**，不能指望跳过 |
+| `grpo/mem_now_gb` | 稳定在一个平台值 | 步末常驻显存。前几步从 10 GB 爬到平台值（梯度和优化器状态逐步分配），之后应持平；**持续上涨才是泄漏**。它和 `mem_gb` 两条一起看才能区分"常驻涨"和"瞬时尖峰"——只看这一条会漏掉尖峰，我就是这么误判的（见附三） |
 | `loss` | **≈ 0，且没有意义** | 见下方警告 |
 
 > ⚠️ **别看 loss 曲线。** `num_iterations=1` 时 ratio ≡ 1，per-token loss = −A_g；而组内 advantage 之和恒为 0，所以 `loss_sum` 天然接近 0（只有各条长度不等时才有微小偏离）。**loss 不降不代表没在学**，GRPO 的 loss 是个 surrogate，请只盯 `grpo/accuracy` 和 `grpo/kl`。
@@ -364,8 +392,14 @@ UrbanVideo 1159 个 `.ply`（118.5 GiB）。磁盘吃紧时可改用第九节的
 
 ### ④ 显存 ✅
 
-8 张卡各 40441 MiB。AirCop 8 卡实测平台 **21.7 GB**，余量充足。
-UrbanVideo 单卡峰值 **28.3 GB**，8 卡会 OOM（详见"附：已知限制"）。
+8 张卡各 40441 MiB。
+
+| 配置 | 8 卡实测 | 余量 |
+|---|---|---|
+| AirCop（`config_aircop.yaml`） | 常驻平台 **21.7 GB** | 充足 |
+| UrbanVideo（`config_urbanvideo.yaml`，2026-08-17 修复后） | 15 步峰值序列最高 **34.4 GB** | 约 5 GB |
+
+UrbanVideo 那套是四项改动叠加的结果，缺一项就重新 OOM，详见[附三](#附三显存排查的四个坑2026-08-17)。
 
 ### ⑤ 学习信号 ✅（正式训练前最该看的一项）
 
@@ -388,12 +422,14 @@ UrbanVideo 单卡峰值 **28.3 GB**，8 卡会 OOM（详见"附：已知限制"�
 ```
 单卡 3 步：step1 grad_norm=23.97，成功产出 ckpt
 八卡 14 步（AirCop）：grad_norm 全程非零，accuracy 0.875 / 0.844 / 0.813，显存平台 21.68 GB
-单卡（UrbanVideo）：accuracy 0.75 / 0.906，峰值 28.33 GB
+八卡 15 步（UrbanVideo，2026-08-17 修复后）：无 OOM，kl 0.0002~0.0046 正常，
+  峰值序列 20.7 24.9 28.5 19.7 24.6 24.3 34.4 25.2 24.8 19.9 28.4 23.2 24.9 25.2 23.4
 产出 ckpt 已验证可独立 from_pretrained 加载（1.830 B）
 ```
 
 AirCop 8 卡 **≈ 4.0 s/it**（点云编码共享修复前是 9.0 s/it），有效 batch 32 prompt = 256 rollout。
 13578 条 ÷ 32 ≈ 424 step/epoch → **单 epoch 约 30 分钟**。
+UrbanVideo 4080 条 ÷ 32 ≈ **128 step/epoch**，单 epoch 约 20 分钟。
 
 单卡时会出现整步 `grad_norm=0.0`（4 个 micro-batch 全被 `std<=1e-6` 跳过），
 属正常现象；多卡下 32 个 group 里几乎总有带信号的，未再出现。
@@ -444,16 +480,23 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 实测 **≈ 4.0 s/it**，显存平台 21.7 GB / 40 GB，有效 batch 32 prompt = 256 rollout，
 13578 条 ÷ 32 ≈ **424 step/epoch**，单 epoch 约 30 分钟。
 
-### 3) UrbanVideo —— **单卡**（8 卡会 OOM，见第九节）
+### 3) UrbanVideo —— 8 卡（2026-08-17 修复后可用）
 
 ```bash
 cd /home/aiscuser/nyp/3D-RL && \
-CUDA_VISIBLE_DEVICES=0 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-/home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/python \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+/home/aiscuser/miniconda3/envs/spatiallm-grpo/bin/torchrun --nproc_per_node 8 \
   grpo/train_grpo.py --config grpo/config_urbanvideo.yaml
 ```
 
-实测峰值 28.33 GB / 40 GB。
+实测 15 步无 OOM，峰值最高 34.4 GB / 40 GB，余量约 5 GB。
+4080 条 ÷ 32 ≈ **128 step/epoch**，单 epoch 约 20 分钟。
+
+⚠ 余量只有 5 GB，比 AirCop 紧得多。开跑后**盯一下 wandb 的 `grpo/mem_gb`**（真峰值），
+逼近 39 就要停下来降 `max_points`。不要在同一批卡上并行跑别的任务。
+
+⚠ 这个配置里 `max_points: 16384` 会把一半以上样本下采样（本数据集 p50=26.2k），
+输入保真度低于 SFT 时，是为跑通做的取舍。理由和备选方案见[附三](#附三显存排查的四个坑2026-08-17)。
 
 ### 4) 挂后台跑 + 看日志
 
@@ -646,14 +689,17 @@ n 越小噪声越大，想区分 1~2 个百分点的差距建议 `-n 2000` 以�
 
 
 
+## 附一：已知限制
+
 调查过程中发现的、与"能否跑出效果"相关的设计限制，供调参时参考：
 
-- **UrbanVideo 上不了多卡**（本轮实测）：单卡峰值 28.3 GB 可跑，8 卡稳定 OOM 在约 38 GB。
-  静态占用（权重 + ref + 梯度 + 优化器状态）爬坡到 21.7 GB 后，点云编码器的激活尖峰
-  再叠 DDP 梯度桶就顶穿 40 GB。**已试过且无效**：`max_points` 65536→16384、
-  `num_generations` 8→4、`adamw_bnb_8bit`、`gradient_checkpointing`、`expandable_segments`
-  ——峰值都稳在 38 GB。真要上多卡得砍掉编码器激活本身（冻结点云塔，或让它走 bf16），
-  这会改动 SFT 共用的模型代码，本轮没做。
+- ~~**UrbanVideo 上不了多卡**~~ —— **已于 2026-08-17 解决**，现在 8 卡可跑（峰值 34.4 GB）。
+  这条原来的记录（"单卡 28.3 GB 可跑，8 卡稳定 OOM"，以及一串"已试过且无效"的办法）
+  **几乎每一句都是错的**，误导了后续排查好几个小时。完整的错因分析、当时是怎么误判的、
+  以及最终解法见[附三](#附三显存排查的四个坑2026-08-17)。
+- **UrbanVideo 的显存余量只有约 5 GB**（AirCop 是 18 GB）。它靠四项改动叠加才跑通，
+  其中 `max_points: 16384` 是有代价的：本数据集 p50=26.2k 点，一半以上样本被下采样，
+  输入保真度低于 SFT 时。要拿回精度得上 DeepSpeed ZeRO-2 腾出静态基线（未做）。
 - **`num_iterations: 1` 是单步 on-policy**，ratio 恒为 1，`clip_eps` 永不触发。多步更新（复用 rollout 做多次梯度更新）尚未实现，调大该值无效。
 - **reward 只支持单选题**（`reward.py` 的 `CHOICES` 现已放宽到 A–H，覆盖 AirCop 的 A–D 和 UrbanVideo 的 A–G）。grounding / bbox 任务喂进来会全部拿 0 分 → 整组被 `std<=1e-6` 跳过 → 一步梯度都不产生。grounding 目前只有 SFT（`configs/spatiallm_grounding.yaml`）。
 - **`tok_total` 未跨卡同步**：各卡回答长短不一导致分母不同，DDP 梯度平均后等价于给不同卡的 token 赋了不同权重。
@@ -697,3 +743,143 @@ n 越小噪声越大，想区分 1~2 个百分点的差距建议 `-n 2000` 以�
 | `train_grpo.py` | 透传 `max_points` / `stream_sampler`；wandb 环境变量提前注入；训练结束打印峰值显存 |
 | `.gitignore` | 追加 `wandb/` |
 
+
+### 第三轮：UrbanVideo 显存问题（2026-08-17）
+
+| 文件 | 改动 |
+|---|---|
+| `grpo_trainer.py` | **`compute_loss` 里把 ref 前向移到 policy 带梯度前向之前**（标记 `(4a)`）。原顺序下 ref 的瞬时激活叠在 policy 那张还没 backward 的反向图上面，两个峰值重叠。ref 是冻结的、`ref_logp` 不参与求导，所以调换顺序**数学完全等价**，纯赚显存 |
+| `grpo_trainer.py` | **新增 `_wrap_model` 覆盖，打开 DDP 的 `gradient_as_bucket_view`**。DDP 默认同时持有「梯度本体」和「allreduce 通信桶」两份完整拷贝（1.83B 参数 bf16 各 3.7 GB）。HF 的 `TrainingArguments` 没暴露这个开关，只能在 `_wrap_model()` 之后补设——写在 `__init__` 里会**静默失效**（那时 `ddp_handler` 还不存在，而且随后会被 `_wrap_model` 整个覆盖赋值） |
+| `grpo_trainer.py` | **`grpo/mem_gb` 改用 `max_memory_allocated()` + 每步 `reset_peak_memory_stats()`**，并新增 `grpo/mem_now_gb`（常驻）。原来只报 `memory_allocated()`（步末常驻），测不到步内瞬时峰值——这是导致本轮多次误判的直接原因 |
+| `config_urbanvideo.yaml` | `gradient_checkpointing: false→true`、`max_points: 65536→16384`、`logp_batch_size: 4→1`、新增 `optim: adamw_bnb_8bit`；`save_steps: 200→25`；header 全部重写 |
+| `config_urbanvideo.yaml` | **`save_steps: 200→25`**：8 卡下 UrbanVideo 只有 128 步/epoch，200 步意味着一个中间 ckpt 都存不下 |
+
+---
+
+## 附三：显存排查的四个坑（2026-08-17）
+
+> 这一节记的是**排查过程中犯的错**，不是结论。留着是因为这些错误模式会重复出现，
+> 而且其中三个都是"看起来已经验证过了、实际上验证方式是错的"。
+
+### 症状
+
+UrbanVideo 8 卡 OOM。当时 README 和 config 里记着一串"已试过且无效"的办法
+（降 `max_points`、降 `G`、8bit 优化器、梯度检查点、`expandable_segments`），
+并给出结论：**只能单卡跑**。
+
+### 坑 1：用常驻显存去测瞬时开销 —— 四条"无效"结论里有三条因此站不住
+
+`grpo/mem_gb` 当时用的是 `torch.cuda.memory_allocated()`，在**步末**采样，测的是
+「当前常驻」。而 OOM 是由**步内瞬时峰值**决定的，点云编码器和 policy 反向图的开销
+恰恰全是瞬时的——常驻值根本反映不出来。
+
+后果是：改了 `max_points` 之后去看 `mem_gb`，两组数字几乎逐位相同，于是判定"无效"。
+把指标换成 `max_memory_allocated()` + 每步 `reset_peak_memory_stats()` 之后重测，
+同一批数据、同一个 seed、第 9 步：
+
+```
+max_points=65536: 12.5 21.3 27.1 24.7 24.1 25.2 33.7 26.6 ✗OOM
+max_points=16384: 11.7 20.2 25.0 24.6 23.3 24.6 29.4 25.8 35.6 23.4 ... ✓跑满 15 步
+```
+
+**差别是决定性的。** 一个"已验证无效"的手段，其实是救命的那一项。
+
+> **教训**：显存指标必须报**峰值**。只报常驻，等于给自己一条永远平坦的曲线，
+> 而真正会杀死训练的那个尖峰完全看不见。
+
+### 坑 2：在崩溃点之前的资源上做优化 —— "8bit 优化器无效"
+
+`adamw_bnb_8bit` 理论上能把 AdamW 的 fp32 m/v 从 14.6 GB 压到 3.7 GB，
+但实测"完全没用，峰值纹丝不动"。
+
+真实原因：当时 8 卡是在 **step 1 的生成阶段**就爆的，`mem_gb` 一条日志都没打出来。
+而**优化器状态是第一次 `optimizer.step()` 才惰性分配的**——崩溃发生时它压根还不在显存里，
+砍一个还不存在的东西当然没有任何效果。
+
+等梯度检查点把崩溃点推后到第 4 步之后，8bit 立刻就省出了约 2 GB。
+
+> **教训**：OOM 时先看**栈**，确认爆在哪个阶段，再决定砍什么。
+> 「这个东西很大」不等于「爆的时候它在场」。
+
+### 坑 3：靠显存账推理，而不是看 traceback
+
+我先后给出过两个听起来都很合理的错误归因：
+
+1. "是优化器状态 + DDP 梯度桶把 40 GB 顶穿了" —— 账算得很整齐（单卡 28.3 / 4 卡 36.0，
+   差 7.7 GB 正好等于梯度本体 + 通信桶两份 bf16 拷贝），但方向是错的。
+2. "是 UrbanVideo 点云文件大 30 倍，Sonata 激活撑爆了" —— 也错。
+
+真去看 traceback，位置是固定的：
+
+```
+compute_loss → _logprobs_chunked → _seq_logprobs
+```
+
+即 **policy 的带梯度 log-prob 前向**，不是 generate，不是点云塔。
+看到栈之后五分钟就定位对了，而在此之前推理了几个小时。
+
+> **教训**：traceback 是免费的、确定性的证据。推理是有成本的、容易自洽的猜测。
+> 先看栈。
+
+### 坑 4：短测试给出假的"能跑"结论
+
+"UrbanVideo 单卡可跑，峰值 28.3 GB" 这个结论是只跑了三五步得出的。
+实际跑到 10 步：
+
+```
+10.8 / 14.5 / 35.5 / 18.1 / 33.8 / 21.7 / ✗OOM(第 7 步)
+```
+
+差一点就照着这个结论去挂一个 1020 步的通宵训练，几十步内就会挂掉。
+
+显存会随数据波动，而波动的来源是 **GRPO 的零方差跳过**：一组 G 条 rollout
+**全对或全错**都会 `std=0` 被 `continue`，那一步不建反向图，显存就低；有对有错才吃梯度。
+所以前几步很可能恰好都是被跳过的轻量步。
+
+> **教训**：显存类结论至少跑 15 步。并且留余量要按
+> **"所有 group 都产生梯度"的最坏情况**算，不能指望跳过帮你省显存。
+
+### 一个次要发现：HF 的 `ddp_handler` 会被覆盖
+
+想给 DDP 打开 `gradient_as_bucket_view`（`TrainingArguments` 没暴露），
+自然想法是在 `Trainer.__init__` 之后设 `self.accelerator.ddp_handler.gradient_as_bucket_view = True`。
+**这会静默失效**：`ddp_handler` 是在 `Trainer._wrap_model()` 里现场 `new` 出来并
+**整体覆盖赋值**的（`transformers/trainer.py` 约 2097 行），`__init__` 时它还不存在。
+正确做法是覆盖 `_wrap_model`，在 `super()._wrap_model()` 之后再设。
+
+因为这个，我有一整轮测试是白做的——代码看着改了，实际一行没生效。
+
+### 最终解法
+
+四项叠加，**单独去掉任何一项都会重新 OOM**：
+
+| 改动 | 性质 | 攻击的是什么 |
+|---|---|---|
+| `gradient_checkpointing: true` | 配置 | 语言塔反向激活（最大的一刀，峰值 35→22） |
+| `max_points: 65536 → 16384` | 配置 | 点云塔瞬时峰值（第 9 步的救命项） |
+| `logp_batch_size: 4 → 1` | 配置 | 单次带梯度前向的瞬时峰值 |
+| ref 前向移到 policy 之前 | 代码 | ref 激活与 policy 反向图的**峰值重叠** |
+| `optim: adamw_bnb_8bit` | 配置 | 优化器状态（约 2 GB） |
+| `gradient_as_bucket_view` | 代码 | DDP 的一份梯度拷贝 |
+
+结果：8 卡 15 步无 OOM，峰值最高 34.4 GB / 39.5 GB。
+
+### 代价与后续
+
+`max_points: 16384` **会改变训练输入**：本数据集 p50=26.2k 点、p90=59.1k，
+一半以上样本被随机下采样，保真度低于 SFT 时。会不会掉点需要实测对比。
+
+想拿回精度的两条路（都未做）：
+
+1. 试 `max_points: 32768`——现在其他几项已经腾出余量，可能塞得下。
+2. **DeepSpeed ZeRO-2**：分片梯度和优化器状态，每卡静态基线约省 16 GB。
+   注意它**不分片激活**，而本例爆的正是激活，所以它是靠压低基线间接买余量。
+   接入前必须先改 `grpo_trainer.py` 里 `base = model.module if hasattr(model, "module") else model`
+   这个写法——它绕过了外层包装器，在 ZeRO 下会导致 reduce-scatter 不完整，
+   **不报错但训错**，比 OOM 难发现得多。
+
+### 一句话总结
+
+四个坑里有三个是**测量方式错了**，不是判断力不够。
+显存问题上，先把「量得准」解决掉（报峰值、看栈、跑够步数），
+再谈「改什么」——否则每一次"已验证无效"都在给后面的人埋雷。
