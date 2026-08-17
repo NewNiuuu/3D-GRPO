@@ -327,6 +327,32 @@ run_name: aircop-g8-lr1e6         # 这次 run 的名字，wandb 里就显示它
 自定义的 `grpo/*` 键走 `self.log()`，会自动进 wandb，不需要额外改代码。
 事后画曲线也可以直接读 `output_dir/trainer_state.json` 里的 `log_history`。
 
+**⚠ 本机容器预置了一整套 `WANDB_*` 环境变量，会劫持所有 run**（2026-08-17 踩到）：
+
+```
+WANDB_RUN_ID=7213779716.62777-72df8069-dba0    ← 固定的 run id，才是罪魁祸首
+WANDB_PROJECT=vllm-sh-wanli
+WANDB_NAME=4x-palisades33-LLM2CLIP-yif-unirun-40Ga100
+WANDB_RUN_GROUP / WANDB_NOTES
+```
+
+wandb 会自动读 `WANDB_RUN_ID`，于是**每次启动训练都挂到同一个 run 上**——本机
+`wandb/` 下 15 个 run 目录全是同一个 id。症状是：打开页面看到的是历次启动叠在一起的
+曲线，而新一轮的 step 从 1 重新开始、低于服务端已有的最大 step，图上看着就像
+"还是上一轮的曲线，而且不实时刷新"。另外 `WANDB_PROJECT` 会让 run 跑到
+`vllm-sh-wanli` 里去，`spatiallm-grpo` 项目下什么都看不到。
+
+`train_grpo.py` 已在 `wandb.init` 之前主动清掉 `WANDB_RUN_ID` / `WANDB_RESUME` /
+`WANDB_RUN_GROUP` / `WANDB_NOTES`，并把 `WANDB_PROJECT` 由 `setdefault` 改成强制赋值
+（原来的 `setdefault` 拗不过环境变量）。想续跑某个 run 时在 config 里填
+`wandb_run_id: xxxx` 即可。
+
+已经被污染的本地 run 数据不会丢，训练结束后可以重新灌进一个干净的 run：
+
+```bash
+wandb sync wandb/run-<时间戳>-<旧id> --id <随便起个新id> -p spatiallm-grpo
+```
+
 **wandb 上该盯哪几条曲线**（按重要性排序）：
 
 | 面板 | 期望走势 | 不对劲时怎么办 |

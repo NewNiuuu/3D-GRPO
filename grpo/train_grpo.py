@@ -51,8 +51,30 @@ def main():
     # ---- wandb ----
     # HF 通过 report_to=wandb 自动接管；这里只把项目名/离线模式提前塞进环境变量，
     # 因为 wandb 在 TrainingArguments 构造时就会读它们。
+    #
+    # ⚠ 本机（AISC 容器）预置了一整套 WANDB_* 环境变量，是给平台自己的任务用的：
+    #     WANDB_RUN_ID=7213779716.62777-72df8069-dba0   ← 固定的 run id
+    #     WANDB_PROJECT=vllm-sh-wanli
+    #     WANDB_NAME=4x-palisades33-LLM2CLIP-yif-unirun-40Ga100
+    #     WANDB_RUN_GROUP / WANDB_NOTES
+    # wandb 会自动读 WANDB_RUN_ID，于是**每次启动训练都挂到同一个 run 上**：
+    # 曲线是历次启动叠在一起的，而且新点的 step 从 1 重新开始、低于服务端已有的
+    # 最大 step，图上看着就是"还是上一轮的曲线、也不实时刷新"。
+    # 所以这里必须主动清掉继承来的 run 身份，让每次启动都开新 run。
     if "wandb" in str(cfg.get("report_to", "")):
-        os.environ.setdefault("WANDB_PROJECT", cfg.get("wandb_project", "spatiallm-grpo"))
+        # 用 = 而不是 setdefault：否则容器里的 WANDB_PROJECT 会盖掉 config
+        os.environ["WANDB_PROJECT"] = cfg.get("wandb_project", "spatiallm-grpo")
+        # 清掉继承来的 run 身份（除非 config 里显式要求续跑某个 run）
+        for k in ("WANDB_RUN_ID", "WANDB_RESUME", "WANDB_RUN_GROUP", "WANDB_NOTES"):
+            os.environ.pop(k, None)
+        if cfg.get("run_name"):
+            os.environ["WANDB_NAME"] = cfg["run_name"]
+        else:
+            os.environ.pop("WANDB_NAME", None)
+        # 想续跑之前的 run 时才填：wandb_run_id: xxxx
+        if cfg.get("wandb_run_id"):
+            os.environ["WANDB_RUN_ID"] = str(cfg["wandb_run_id"])
+            os.environ["WANDB_RESUME"] = "allow"
         if cfg.get("wandb_offline", False):
             os.environ["WANDB_MODE"] = "offline"
 
